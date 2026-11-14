@@ -80,6 +80,21 @@ updates:
 - **npm uses trusted publishing.** There is no npm token after a package's
   first release, and every version carries npm provenance.
 
+## Setting up a repository
+
+Once per repository, in **Settings, Environments**:
+
+1. Create an environment for each channel you turn on: `npm`, `homebrew`,
+   `aur`.
+2. In each, under **Deployment branches and tags**, choose selected branches
+   and tags and add the tag rule `v*`, so only a release tag can use its
+   secret. Add required reviewers if a person should approve every publish.
+3. Add that channel's secret to it, as its section below describes.
+
+Then add the workflow file from [Use it](#use-it), and optionally
+`.github/dependabot.yml`. Nothing else in the repository changes. A pull
+request that touches the workflow file runs the whole release as a dry run.
+
 ## npm
 
 In app mode the project's own package is published with a `bin` launcher
@@ -102,18 +117,34 @@ uses a token:
 
 ## Homebrew
 
-Set `homebrew-tap: you/homebrew-tap` and store a fine-grained token with
-contents read and write on that one repository as `HOMEBREW_TAP_TOKEN` in the
-`homebrew` environment. The release writes `Formula/<bin>.rb` there. The
+Homebrew installs from a **tap**, a separate repository holding formulas. One
+tap serves every program you release, so you make it once:
+
+1. Create a public repository named `homebrew-<something>`, such as
+   `you/homebrew-tap`. The `homebrew-` prefix is what lets users write
+   `brew install you/tap/<bin>`. It can start empty.
+2. Create a fine-grained personal access token (GitHub settings, Developer
+   settings, Fine-grained tokens) with **Repository access** set to that one
+   tap repository and **Contents: Read and write**, nothing else. Give it an
+   expiry and note when to rotate it.
+3. In each repository that releases, store the token as `HOMEBREW_TAP_TOKEN`
+   in its `homebrew` environment, and set `homebrew-tap: you/homebrew-tap`.
+
+Each release commits `Formula/<bin>.rb` to the tap's default branch. The
 formula installs the tarball under `libexec` and puts an exec script on
 `PATH`, so the binary runs by its absolute path and can find files beside it.
-Users run `brew install you/tap/<bin>`.
 
 ## AUR
 
-Set `aur-package: <name>-bin`, add an SSH key to your AUR account, and store
-the private key as `AUR_SSH_KEY` in the `aur` environment. The first release
-creates the package. The package installs the Linux tarball under
+1. Pick a package name ending in `-bin` that is free on
+   [aur.archlinux.org](https://aur.archlinux.org/packages), and check that no
+   Arch package already installs a `/usr/bin/<bin>`.
+2. Make a key used only for this: `ssh-keygen -t ed25519 -N "" -f aur`.
+   Add `aur.pub` to your AUR account (My Account, SSH Public Key).
+3. Store the private key, the contents of `aur`, as `AUR_SSH_KEY` in the `aur`
+   environment, set `aur-package: <name>-bin`, and delete the local copy.
+
+The first release creates the package. It installs the Linux tarball under
 `/opt/<package>` and links the command into `/usr/bin`. The job pushes only to
 a server presenting the host key Arch Linux published for aur.archlinux.org.
 
