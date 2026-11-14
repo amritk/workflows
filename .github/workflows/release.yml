@@ -169,6 +169,7 @@ jobs:
       npm: ${{ steps.plan.outputs.npm }}
       version: ${{ steps.plan.outputs.version }}
       publish: ${{ steps.plan.outputs.publish }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
       check-version: ${{ steps.plan.outputs.check-version }}
       nish-version: ${{ steps.plan.outputs.nish-version }}
       rows: ${{ steps.plan.outputs.rows }}
@@ -308,6 +309,9 @@ jobs:
             echo "npm=$NPM"
             echo "version=$version"
             echo "publish=$publish"
+            # 1.2.0-rc.1 is a prerelease: marked so on GitHub, published to
+            # npm under the `next` dist-tag, and kept out of Homebrew and the AUR.
+            case "$version" in *-*) echo "prerelease=true" ;; *) echo "prerelease=false" ;; esac
             echo "check-version=$check"
             echo "nish-version=${nish:-}"
             echo "rows=$rows"
@@ -651,12 +655,16 @@ jobs:
         if: needs.plan.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
         run: |
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
           gh release create "$GITHUB_REF_NAME" "$DIST"/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "${BIN:-$GITHUB_REPOSITORY} $GITHUB_REF_NAME" \
             --generate-notes \
-            --verify-tag
+            --verify-tag \
+            "${flags[@]}"
 
   npm:
     name: npm
@@ -698,6 +706,7 @@ jobs:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_ENVIRONMENT: ${{ inputs.npm-environment }}
           PRIVATE: ${{ needs.plan.outputs.private }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
         run: |
           if [ -n "$NPM_TOKEN" ]; then
             # Only for a first publish. The file holds the literal
@@ -711,6 +720,8 @@ jobs:
             provenance=--no-provenance
             echo "::notice::a private repository gets no npm provenance"
           fi
+          dist_tag=latest
+          if [ "$PRERELEASE" = "true" ]; then dist_tag=next; fi
           main=""
           order=()
           for tgz in npm/*.tgz; do
@@ -732,12 +743,12 @@ jobs:
               echo "::error::$name has never been published, so it cannot trust this workflow yet. Pass the NPM_TOKEN secret for its first release, then configure trusted publishing for $GITHUB_REPOSITORY with workflow file $(basename "${GITHUB_WORKFLOW_REF%@*}") and environment $NPM_ENVIRONMENT."
               exit 1
             fi
-            npm publish "$tgz" --access public "$provenance"
+            npm publish "$tgz" --access public --tag "$dist_tag" "$provenance"
           done
 
   homebrew:
     name: homebrew
-    if: inputs.homebrew-tap != '' && needs.plan.outputs.publish == 'true'
+    if: inputs.homebrew-tap != '' && needs.plan.outputs.publish == 'true' && needs.plan.outputs.prerelease != 'true'
     needs: [plan, release]
     runs-on: ubuntu-24.04
     environment: ${{ inputs.homebrew-environment }}
@@ -805,7 +816,7 @@ jobs:
 
   aur:
     name: aur
-    if: inputs.aur-package != '' && needs.plan.outputs.publish == 'true'
+    if: inputs.aur-package != '' && needs.plan.outputs.publish == 'true' && needs.plan.outputs.prerelease != 'true'
     needs: [plan, release]
     runs-on: ubuntu-24.04
     environment: ${{ inputs.aur-environment }}
