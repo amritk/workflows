@@ -1,6 +1,7 @@
 # Tests this repository: the packaging tools' unit tests, actionlint over the
 # workflows, and the release workflow itself, run end to end on test/hello as
-# an app on every target with every channel turned on, and as a library. Off a tag that
+# an app on every target with every channel turned on, as a library, and as a
+# library versioned by release-please (its config checked). Off a tag that
 # run builds, smoke-tests and packs everything and publishes nothing, and
 # this workflow never runs on a tag, so it cannot publish test/hello.
 
@@ -63,3 +64,19 @@ jobs:
       mode: library
       directory: test/hello
       test: nish src/main.ts -o "$RUNNER_TEMP/hello.ll"
+
+  # Checks test/hello's release-please config the way a caller's is checked on
+  # every run. CI never calls release-please.yml, which would open release PRs
+  # and push tags here.
+  release-please-dry-run:
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    with:
+      mode: library
+      directory: test/hello
+      versioning: release-please
+      release-please-config: test/hello/release-please-config.json
+      release-please-manifest: test/hello/.release-please-manifest.json

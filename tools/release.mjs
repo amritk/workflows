@@ -11,6 +11,7 @@
  *   release.mjs library <out> <version>
  *   release.mjs formula --name --bin --version --tag --repo --summary --homepage --license --sums
  *   release.mjs aur <dir> --package --bin --version --tag --repo --summary --homepage --license --sums [--maintainer]
+ *   release.mjs release-please <config> <manifest> <path> [<version>]
  */
 import { spawnSync } from "node:child_process"
 import fs from "node:fs"
@@ -450,6 +451,47 @@ export const aur = (dir, flags) => {
   return { pkgbuild, srcinfo }
 }
 
+// --- release-please ------------------------------------------------------------
+
+/**
+ * Check a release-please config and manifest can drive this workflow, and
+ * return the release-please path of the package. The release runs on a
+ * `v<version>` tag, so release-please must tag exactly that: one package, no
+ * component in the tag, and the `v` kept. The manifest must also agree with
+ * package.json, or the first release PR would bump from the wrong version.
+ */
+export const releasePleaseCheck = (config, manifest, directory, version = "") => {
+  const key = path.posix.normalize(directory.replace(/\/+$/, "") || ".").replace(/^\.\//, "")
+  const packages = Object.keys(config.packages ?? {})
+  if (packages.length !== 1 || packages[0] !== key) {
+    fail(
+      `the release-please config must hold one package, "${key}" (the directory input); it holds ${JSON.stringify(packages)}. A repository releasing several packages needs per-package tags, which this workflow does not release`,
+    )
+  }
+  const settings = { ...config, ...config.packages[key] }
+  if (!settings["release-type"]) {
+    fail(`the release-please config sets no release-type for "${key}"; use "node" for a package.json, or "simple"`)
+  }
+  if (settings["include-component-in-tag"] !== false) {
+    fail(
+      'the release-please config must set "include-component-in-tag": false, so the tag is v<version>, the tag this workflow releases',
+    )
+  }
+  if (settings["include-v-in-tag"] === false) {
+    fail('the release-please config sets "include-v-in-tag": false; this workflow releases only v<version> tags')
+  }
+  if (settings.draft === true) {
+    fail('the release-please config sets "draft": true; a draft release has no tag to run the release on')
+  }
+  if (typeof manifest[key] !== "string") {
+    fail(`the release-please manifest has no version for "${key}"; add { "${key}": "<the current version>" }`)
+  }
+  if (version !== "" && manifest[key] !== version) {
+    fail(`the release-please manifest says "${key}" is ${manifest[key]}, but package.json's version is ${version}`)
+  }
+  return key
+}
+
 // --- command line ---------------------------------------------------------------
 
 const USAGE = `usage: release.mjs rows <targets-json>
@@ -457,7 +499,8 @@ const USAGE = `usage: release.mjs rows <targets-json>
        release.mjs main <out> <bin> <version> <asset>...
        release.mjs library <out> <version>
        release.mjs formula --name N --bin B --version V --tag T --repo O/R --summary S --sums FILE [--homepage U] [--license L]
-       release.mjs aur <dir> --package P --bin B --version V --tag T --repo O/R --summary S --sums FILE [--homepage U] [--license L] [--maintainer M]`
+       release.mjs aur <dir> --package P --bin B --version V --tag T --repo O/R --summary S --sums FILE [--homepage U] [--license L] [--maintainer M]
+       release.mjs release-please <config> <manifest> <path> [<version>]`
 
 const cli = (argv) => {
   const [command, ...args] = argv
@@ -483,6 +526,9 @@ const cli = (argv) => {
     case "aur":
       if (rest.length !== 1) break
       return aur(rest[0], flags).pkgbuild.trimEnd()
+    case "release-please":
+      if (rest.length < 3 || rest.length > 4) break
+      return releasePleaseCheck(readJson(rest[0]), readJson(rest[1]), rest[2], rest[3])
   }
   fail(USAGE)
 }

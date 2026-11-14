@@ -10,6 +10,13 @@
 # A run on a `v*` tag releases. Any other run (a pull request, a manual run)
 # builds, smoke-tests and packs everything, and releases and publishes nothing.
 #
+# Versioning: with `versioning: tag` (the default) a person pushes the tag.
+# With `versioning: release-please`, the caller also calls release-please.yml,
+# which keeps a release PR open and, once merging it has tagged a release,
+# starts the caller's workflow on that tag. This workflow checks the
+# release-please config on every run and does nothing on a push to the
+# default branch, which is release-please.yml's run.
+#
 # Security: the jobs that run the caller's code (check, build) can read the
 # repository and nothing else, and hold no secret. The jobs that publish run
 # none of the caller's code: they republish the files the build attested, and
@@ -25,6 +32,18 @@ on:
         description: "`app` builds and ships a native program; `library` ships the package's source to npm."
         type: string
         default: app
+      versioning:
+        description: "`tag`: a person pushes the `v*` tag. `release-please`: release-please.yml cuts the tag; this workflow checks its config and skips pushes to the default branch."
+        type: string
+        default: tag
+      release-please-config:
+        description: The release-please config, from the repository root, with `versioning` release-please.
+        type: string
+        default: .github/release-please-config.json
+      release-please-manifest:
+        description: The release-please manifest, from the repository root, with `versioning` release-please.
+        type: string
+        default: .github/.release-please-manifest.json
       bin:
         description: The command name and the binary's file name, in app mode. Empty uses package.json's name without its scope.
         type: string
@@ -169,6 +188,7 @@ jobs:
       npm: ${{ steps.plan.outputs.npm }}
       version: ${{ steps.plan.outputs.version }}
       publish: ${{ steps.plan.outputs.publish }}
+      versioning: ${{ steps.plan.outputs.versioning }}
       prerelease: ${{ steps.plan.outputs.prerelease }}
       check-version: ${{ steps.plan.outputs.check-version }}
       nish-version: ${{ steps.plan.outputs.nish-version }}
@@ -222,6 +242,11 @@ jobs:
         id: plan
         env:
           MODE: ${{ inputs.mode }}
+          VERSIONING: ${{ inputs.versioning }}
+          RP_CONFIG: ${{ inputs.release-please-config }}
+          RP_MANIFEST: ${{ inputs.release-please-manifest }}
+          DIRECTORY: ${{ inputs.directory }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           BIN: ${{ inputs.bin }}
           TARGETS: ${{ inputs.targets }}
           DRY_RUN_EVENT: ${{ github.event_name }}
@@ -254,7 +279,34 @@ jobs:
             fi
           fi
           pkg_version="$(pkg .version)"
-          if [ "$GITHUB_REF_TYPE" = "tag" ] && [[ "$GITHUB_REF_NAME" == v* ]]; then
+
+          # Which run this is: a release (a v* tag), a release-please run (a
+          # push to the default branch), or a dry run (anything else).
+          case "$VERSIONING" in
+            tag) ;;
+            release-please)
+              root="$GITHUB_WORKSPACE/repo"
+              for f in "$RP_CONFIG" "$RP_MANIFEST"; do
+                test -f "$root/$f" || { echo "::error::versioning is release-please but there is no $f; see this workflow's README, \"Versioning\""; exit 1; }
+              done
+              node "$WORKFLOWS/tools/release.mjs" release-please "$root/$RP_CONFIG" "$root/$RP_MANIFEST" "$DIRECTORY" "$pkg_version"
+              ;;
+            changesets) echo "::error::versioning changesets is not supported yet; use tag or release-please"; exit 1 ;;
+            *) echo "::error::versioning is \"$VERSIONING\"; it is tag or release-please"; exit 1 ;;
+          esac
+          if [ "$VERSIONING" = "release-please" ] && [ "$GITHUB_EVENT_NAME" = "push" ] \
+            && [ "$GITHUB_REF_TYPE" = "branch" ] && [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ]; then
+            versioning=release-please
+          else
+            versioning=""
+          fi
+
+          if [ -n "$versioning" ]; then
+            publish=false
+            version="${pkg_version:-0.0.0}"
+            check=false
+            echo "::notice::a push to $GITHUB_REF_NAME: release-please.yml updates the release PR, and the release runs on the tag merging it creates"
+          elif [ "$GITHUB_REF_TYPE" = "tag" ] && [[ "$GITHUB_REF_NAME" == v* ]]; then
             publish=true
             version="${GITHUB_REF_NAME#v}"
             if [ -n "$pkg_version" ] && [ "$pkg_version" != "$version" ]; then
@@ -309,6 +361,7 @@ jobs:
             echo "npm=$NPM"
             echo "version=$version"
             echo "publish=$publish"
+            echo "versioning=$versioning"
             # 1.2.0-rc.1 is a prerelease: marked so on GitHub, published to
             # npm under the `next` dist-tag, and kept out of Homebrew and the AUR.
             case "$version" in *-*) echo "prerelease=true" ;; *) echo "prerelease=false" ;; esac
@@ -325,10 +378,11 @@ jobs:
           if [ "$MODE" = "app" ]; then printf '%s' "$rows" | jq -r '.[] | "\(.asset) on \(.runner)"'; fi
 
   # The caller's own checks, once, before anything is built or packed. Holds
-  # no secret.
+  # no secret. Skipped on a push release-please.yml handles.
   check:
     name: check
     needs: plan
+    if: needs.plan.outputs.versioning == ''
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -657,6 +711,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PRERELEASE: ${{ needs.plan.outputs.prerelease }}
         run: |
+          # release-please (or a person) may have created the release already;
+          # then keep its notes and add the files. A re-run replaces them.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$DIST"/* --repo "$GITHUB_REPOSITORY" --clobber
+            if [ "$PRERELEASE" = "true" ]; then
+              gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --prerelease
+            fi
+            exit 0
+          fi
           flags=()
           if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
           gh release create "$GITHUB_REF_NAME" "$DIST"/* \
