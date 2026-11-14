@@ -561,9 +561,13 @@ jobs:
     env:
       BIN: ${{ needs.plan.outputs.bin }}
       VERSION: ${{ needs.plan.outputs.version }}
-      DIST: ${{ runner.temp }}/dist
       PUBLISH: ${{ needs.plan.outputs.publish }}
     steps:
+      # A job's env cannot read the runner context, so DIST is set here.
+      - name: Where the release's files gather
+        working-directory: .
+        run: echo "DIST=$RUNNER_TEMP/dist" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: repo
