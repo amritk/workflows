@@ -405,11 +405,11 @@ jobs:
 
       - name: The runner is the platform the target names
         env:
-          HOST: ${{ matrix.target.host }}
+          WANT_HOST: ${{ matrix.target.host }}
         run: |
-          host="$(uname -s)-$(uname -m)"
-          if [ "$host" != "$HOST" ]; then
-            echo "::error::this runner is $host, but $ASSET is built on $HOST"
+          actual="$(uname -s)-$(uname -m)"
+          if [ "$actual" != "$WANT_HOST" ]; then
+            echo "::error::this runner is $actual, but $ASSET is built on $WANT_HOST"
             exit 1
           fi
 
@@ -697,10 +697,10 @@ jobs:
           PRIVATE: ${{ needs.plan.outputs.private }}
         run: |
           if [ -n "$NPM_TOKEN" ]; then
-            # Only for a first publish. npm expands the reference itself, so
-            # the token is never written to disk.
-            # shellcheck disable=SC2016
-            printf '//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n' > "$RUNNER_TEMP/.npmrc"
+            # Only for a first publish. The file holds the literal
+            # ${NPM_TOKEN}, which npm expands itself, so the token is never
+            # written to disk.
+            printf '%s\n' "//registry.npmjs.org/:_authToken=\${NPM_TOKEN}" > "$RUNNER_TEMP/.npmrc"
             export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/.npmrc"
           fi
           provenance=--provenance
