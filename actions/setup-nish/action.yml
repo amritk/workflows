@@ -73,8 +73,13 @@ runs:
         DIR: ${{ steps.pin.outputs.dir }}
       run: |
         # The installer comes from the release's own tag, so it is pinned too.
-        curl -fsSL --retry 3 "https://raw.githubusercontent.com/amritk/nish/v$VERSION/install.sh" |
-          sh -s -- "$VERSION" --dir "$DIR" --force --no-modify-path
+        installer="$RUNNER_TEMP/nish-install.sh"
+        curl -fsSL --retry 3 -o "$installer" "https://raw.githubusercontent.com/amritk/nish/v$VERSION/install.sh"
+        # Installers since 0.40 edit shell startup files unless told not to;
+        # older ones do not know the flag and never edit them.
+        flags=(--dir "$DIR" --force)
+        if grep -q -- '--no-modify-path' "$installer"; then flags+=(--no-modify-path); fi
+        sh "$installer" "$VERSION" "${flags[@]}"
         test "$("$DIR/bin/nish" --version | head -n 1 | cut -d' ' -f1-2)" = "nish $VERSION"
         echo "$DIR/bin" >> "$GITHUB_PATH"
         echo "nish=$DIR/bin/nish" >> "$GITHUB_OUTPUT"
