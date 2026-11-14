@@ -296,12 +296,12 @@ jobs:
           esac
           if [ "$VERSIONING" = "release-please" ] && [ "$GITHUB_EVENT_NAME" = "push" ] \
             && [ "$GITHUB_REF_TYPE" = "branch" ] && [ "$GITHUB_REF_NAME" = "$DEFAULT_BRANCH" ]; then
-            versioning=release-please
+            versioning_run=release-please
           else
-            versioning=""
+            versioning_run=""
           fi
 
-          if [ -n "$versioning" ]; then
+          if [ -n "$versioning_run" ]; then
             publish=false
             version="${pkg_version:-0.0.0}"
             check=false
@@ -361,7 +361,7 @@ jobs:
             echo "npm=$NPM"
             echo "version=$version"
             echo "publish=$publish"
-            echo "versioning=$versioning"
+            echo "versioning=$versioning_run"
             # 1.2.0-rc.1 is a prerelease: marked so on GitHub, published to
             # npm under the `next` dist-tag, and kept out of Homebrew and the AUR.
             case "$version" in *-*) echo "prerelease=true" ;; *) echo "prerelease=false" ;; esac
