@@ -678,7 +678,10 @@ jobs:
         run: |
           v="$(npm --version)"
           echo "npm $v"
-          node -e 'const [a, b, c] = process.argv[1].split(".").map(Number); if (a * 1e6 + b * 1e3 + c < 11005001) { console.error(`::error::npm ${process.argv[1]} predates trusted publishing (11.5.1); raise node-version`); process.exit(1) }' "$v"
+          if [ "$(printf '%s\n' 11.5.1 "$v" | sort -V | head -n 1)" != 11.5.1 ]; then
+            echo "::error::npm $v predates trusted publishing (11.5.1); raise node-version"
+            exit 1
+          fi
 
       - name: The packages the release attached, as attached
         env:
