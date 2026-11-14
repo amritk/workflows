@@ -11,6 +11,7 @@ import {
   formula,
   formulaClass,
   launcher,
+  libraryPackage,
   mainPackage,
   parseSums,
   platformPackage,
@@ -218,5 +219,28 @@ describe("npm", () => {
     } finally {
       process.chdir(cwd)
     }
+  })
+
+  it("packs a library as npm would, without `private`", () => {
+    const project = temp()
+    fs.mkdirSync(path.join(project, "src"))
+    fs.writeFileSync(path.join(project, "src", "index.ts"), "export const one = (): number => 1\n")
+    fs.writeFileSync(
+      path.join(project, "package.json"),
+      JSON.stringify({ name: "lib", version: "2.0.0", private: true, files: ["src"] })
+    )
+    const cwd = process.cwd()
+    process.chdir(project)
+    let tarball
+    try {
+      tarball = libraryPackage(temp(), "2.0.0")
+    } finally {
+      process.chdir(cwd)
+    }
+    const manifest = JSON.parse(spawnSync("tar", ["-xzOf", tarball, "package/package.json"], { encoding: "utf8" }).stdout)
+    assert.equal(manifest.private, undefined)
+    assert.equal(manifest.bin, undefined)
+    const list = spawnSync("tar", ["-tzf", tarball], { encoding: "utf8" }).stdout
+    assert.match(list, /^package\/src\/index.ts$/m)
   })
 })

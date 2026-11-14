@@ -1,35 +1,48 @@
-# Release a native command-line program: build it on one runner per target,
-# smoke-test every binary, attach the tarballs to a GitHub release with
-# SHA256SUMS and signed build provenance, and publish it through whichever
-# channels the caller turns on: npm, a Homebrew tap, the AUR.
+# Release a package from a `v*` tag, in one of two modes.
 #
-# Nish programs are built with no build step of their own (`language: nish`,
-# the default); anything else names its build command. README.md has the
-# inputs, the secrets each channel needs and the one-time setup.
+#   app      build a native program on one runner per target, smoke-test every
+#            binary, attach the tarballs to a GitHub release with SHA256SUMS and
+#            signed build provenance, and publish it through the channels the
+#            caller turns on: npm, a Homebrew tap, the AUR.
+#   library  pack the package's source (a Nish library ships as source), attach
+#            it to a GitHub release with provenance, and publish it to npm.
 #
 # A run on a `v*` tag releases. Any other run (a pull request, a manual run)
-# builds and smoke-tests every target, and packs every channel's files, but
-# releases and publishes nothing.
+# builds, smoke-tests and packs everything, and releases and publishes nothing.
+#
+# Security: the jobs that run the caller's code (check, build) can read the
+# repository and nothing else, and hold no secret. The jobs that publish run
+# none of the caller's code: they republish the files the build attested, and
+# each reads its one credential from its own GitHub environment. npm publishes
+# with trusted publishing. README.md has the inputs and the one-time setup.
 
 name: release
 
 on:
   workflow_call:
     inputs:
-      bin:
-        description: The command name, which is also the binary's file name.
+      mode:
+        description: "`app` builds and ships a native program; `library` ships the package's source to npm."
         type: string
-        required: true
+        default: app
+      bin:
+        description: The command name and the binary's file name, in app mode. Empty uses package.json's name without its scope.
+        type: string
+        default: ""
       directory:
         description: The project's directory in the repository, for a repository holding more than one.
         type: string
         default: .
+      test:
+        description: Shell run once in `directory` on Linux before anything is built or packed, with the Nish toolchain installed when `language` is nish. A failure stops the release.
+        type: string
+        default: ""
       language:
         description: "`nish` installs the Nish toolchain and, with no `build`, links `entry`. `none` installs nothing."
         type: string
         default: nish
       entry:
-        description: The Nish entry point to link, with `language: nish` and no `build`.
+        description: "The Nish entry point to link, with `language: nish` and no `build`."
         type: string
         default: src/main.ts
       nish-version:
@@ -81,11 +94,11 @@ on:
         type: string
         default: ""
       npm:
-        description: Publish to npm under package.json's `name`, one package per target plus a launcher package.
+        description: Publish to npm under package.json's `name`; in app mode, with one package per target plus a launcher. Always on in library mode.
         type: boolean
         default: false
       npm-environment:
-        description: The GitHub environment the npm job runs in, which npm trusted publishing names.
+        description: The GitHub environment the npm job runs in, which npm trusted publishing names and which holds NPM_TOKEN for a first publish.
         type: string
         default: npm
       homebrew-tap:
@@ -96,6 +109,10 @@ on:
         description: The formula's name. Empty uses `bin`.
         type: string
         default: ""
+      homebrew-environment:
+        description: The GitHub environment holding HOMEBREW_TAP_TOKEN.
+        type: string
+        default: homebrew
       aur-package:
         description: The AUR package to push a PKGBUILD to, such as `mytool-bin`. Empty skips the AUR.
         type: string
@@ -104,10 +121,18 @@ on:
         description: The PKGBUILD's `# Maintainer:` line, such as `Name <email>`.
         type: string
         default: ""
+      aur-environment:
+        description: The GitHub environment holding AUR_SSH_KEY.
+        type: string
+        default: aur
       node-version:
         description: The Node that packs and publishes. npm trusted publishing needs the npm it bundles to be 11.5.1 or newer.
         type: string
         default: 26.13.1
+    # Keep these in the environments above rather than passing them: a job in
+    # this workflow that names an environment reads that environment's secrets
+    # directly, so each credential reaches the one job that uses it. Passing
+    # them (or `secrets: inherit`) also works.
     secrets:
       NPM_TOKEN:
         description: Only for a package's first npm publish, before trusted publishing can be configured for it.
@@ -139,6 +164,9 @@ jobs:
     outputs:
       workflows-repository: ${{ steps.self.outputs.repository }}
       workflows-sha: ${{ steps.self.outputs.sha }}
+      mode: ${{ steps.plan.outputs.mode }}
+      bin: ${{ steps.plan.outputs.bin }}
+      npm: ${{ steps.plan.outputs.npm }}
       version: ${{ steps.plan.outputs.version }}
       publish: ${{ steps.plan.outputs.publish }}
       check-version: ${{ steps.plan.outputs.check-version }}
@@ -192,6 +220,8 @@ jobs:
       - name: Version, channels and matrix
         id: plan
         env:
+          MODE: ${{ inputs.mode }}
+          BIN: ${{ inputs.bin }}
           TARGETS: ${{ inputs.targets }}
           DRY_RUN_EVENT: ${{ github.event_name }}
           PRIVATE: ${{ github.event.repository.private }}
@@ -206,6 +236,22 @@ jobs:
           LICENSE: ${{ inputs.license }}
         run: |
           pkg() { if [ -f package.json ]; then node -p "require('./package.json')$1 ?? ''"; fi; }
+          case "$MODE" in
+            app | library) ;;
+            *) echo "::error::mode is \"$MODE\"; it is app or library"; exit 1 ;;
+          esac
+          bin="${BIN:-$(pkg .name | sed 's#^@[^/]*/##')}"
+          if [ "$MODE" = "app" ] && [ -z "$bin" ]; then
+            echo "::error::app mode needs a command name: set bin, or a name in package.json"
+            exit 1
+          fi
+          if [ "$MODE" = "library" ]; then
+            NPM=true
+            if [ -n "$TAP" ] || [ -n "$AUR" ]; then
+              echo "::error::a library ships to npm only; Homebrew and the AUR install programs, so use mode app"
+              exit 1
+            fi
+          fi
           pkg_version="$(pkg .version)"
           if [ "$GITHUB_REF_TYPE" = "tag" ] && [[ "$GITHUB_REF_NAME" == v* ]]; then
             publish=true
@@ -223,16 +269,21 @@ jobs:
             echo "::notice::not a v* tag ($DRY_RUN_EVENT on $GITHUB_REF_NAME): building $version on every target and releasing nothing"
           fi
 
-          if [ "$LANGUAGE" = "nish" ]; then
-            nish="$NISH_VERSION"
-            if [ -z "$nish" ]; then
-              test -f .nish-version || { echo "::error::language is nish but there is no nish-version input and no .nish-version file"; exit 1; }
-              nish="$(tr -d '[:space:]' < .nish-version)"
-            fi
-          elif [ "$LANGUAGE" != "none" ]; then
-            echo "::error::language is \"$LANGUAGE\"; it is nish or none"
-            exit 1
-          fi
+          # The compiler is required to build an app; a library needs it only
+          # for its test hook, so there it is installed when it is pinned.
+          nish=""
+          case "$LANGUAGE" in
+            nish)
+              nish="$NISH_VERSION"
+              if [ -z "$nish" ] && [ -f .nish-version ]; then nish="$(tr -d '[:space:]' < .nish-version)"; fi
+              if [ -z "$nish" ] && [ "$MODE" = "app" ]; then
+                echo "::error::language is nish but there is no nish-version input and no .nish-version file"
+                exit 1
+              fi
+              ;;
+            none) ;;
+            *) echo "::error::language is \"$LANGUAGE\"; it is nish or none"; exit 1 ;;
+          esac
 
           if [ "$NPM" = "true" ] && [ -z "$(pkg .name)" ]; then
             echo "::error::npm publishes under package.json's name, and there is no package.json with one"
@@ -252,6 +303,9 @@ jobs:
 
           rows="$(node "$WORKFLOWS/tools/release.mjs" rows "$TARGETS")"
           {
+            echo "mode=$MODE"
+            echo "bin=$bin"
+            echo "npm=$NPM"
             echo "version=$version"
             echo "publish=$publish"
             echo "check-version=$check"
@@ -263,12 +317,59 @@ jobs:
             echo "license=${LICENSE:-$(pkg .license)}"
             echo "private=$private"
           } >> "$GITHUB_OUTPUT"
-          echo "version $version, publish $publish"
-          printf '%s' "$rows" | jq -r '.[] | "\(.asset) on \(.runner)"'
+          echo "$MODE $bin $version, publish $publish"
+          if [ "$MODE" = "app" ]; then printf '%s' "$rows" | jq -r '.[] | "\(.asset) on \(.runner)"'; fi
+
+  # The caller's own checks, once, before anything is built or packed. Holds
+  # no secret.
+  check:
+    name: check
+    needs: plan
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: repo/${{ inputs.directory }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: inputs.test != ''
+        with:
+          path: repo
+          persist-credentials: false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: inputs.test != '' && needs.plan.outputs.nish-version != ''
+        with:
+          repository: ${{ needs.plan.outputs.workflows-repository }}
+          ref: ${{ needs.plan.outputs.workflows-sha }}
+          path: _workflows
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: inputs.test != ''
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Set up Nish
+        if: inputs.test != '' && needs.plan.outputs.nish-version != ''
+        uses: ./_workflows/actions/setup-nish
+        with:
+          version: ${{ needs.plan.outputs.nish-version }}
+
+      - name: Test hook
+        if: inputs.test != ''
+        run: ${{ inputs.test }}
+
+      - name: No test hook
+        if: inputs.test == ''
+        working-directory: .
+        run: echo "no test input; the release relies on the repository's own CI"
 
   build:
     name: build (${{ matrix.target.asset }})
-    needs: plan
+    if: needs.plan.outputs.mode == 'app'
+    needs: [plan, check]
     runs-on: ${{ matrix.target.runner }}
     permissions:
       contents: read
@@ -281,7 +382,7 @@ jobs:
         working-directory: repo/${{ inputs.directory }}
     env:
       ASSET: ${{ matrix.target.asset }}
-      BIN: ${{ inputs.bin }}
+      BIN: ${{ needs.plan.outputs.bin }}
       VERSION: ${{ needs.plan.outputs.version }}
       CHECK_VERSION: ${{ needs.plan.outputs.check-version }}
       REPO: ${{ github.workspace }}/repo/${{ inputs.directory }}
@@ -395,7 +496,7 @@ jobs:
 
       - name: npm packages
         id: npm
-        if: inputs.npm
+        if: needs.plan.outputs.npm == 'true'
         env:
           STAGE: ${{ steps.build.outputs.stage }}
           ASSETS: ${{ needs.plan.outputs.assets }}
@@ -422,7 +523,7 @@ jobs:
           fi
 
       - name: Smoke the npm-installed command
-        if: inputs.npm && inputs.smoke != ''
+        if: needs.plan.outputs.npm == 'true' && inputs.smoke != ''
         working-directory: ${{ runner.temp }}/smoke
         env:
           BIN: ${{ steps.npm.outputs.bin }}
@@ -442,7 +543,11 @@ jobs:
   # PKGBUILD can still be written.
   release:
     name: release
-    needs: [plan, build]
+    # A library has no build job; it is skipped, not failed.
+    if: >-
+      !cancelled() && needs.plan.result == 'success' && needs.check.result == 'success'
+      && (needs.build.result == 'success' || (needs.build.result == 'skipped' && needs.plan.outputs.mode == 'library'))
+    needs: [plan, check, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -454,7 +559,7 @@ jobs:
     outputs:
       sums: ${{ steps.sums.outputs.sums }}
     env:
-      BIN: ${{ inputs.bin }}
+      BIN: ${{ needs.plan.outputs.bin }}
       VERSION: ${{ needs.plan.outputs.version }}
       DIST: ${{ runner.temp }}/dist
       PUBLISH: ${{ needs.plan.outputs.publish }}
@@ -477,12 +582,14 @@ jobs:
 
       # Outside the checkout, so packing the project can never pick these up.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: needs.plan.outputs.mode == 'app'
         with:
           pattern: release-*
           merge-multiple: true
           path: ${{ runner.temp }}/dist
 
       - name: Every target's tarball is here
+        if: needs.plan.outputs.mode == 'app'
         env:
           ASSETS: ${{ needs.plan.outputs.assets }}
         run: |
@@ -491,8 +598,13 @@ jobs:
           done
           ls -l "$DIST"
 
+      - name: The library's npm package
+        if: needs.plan.outputs.mode == 'library'
+        run: |
+          node "$WORKFLOWS/tools/release.mjs" library "$DIST" "$VERSION"
+
       - name: The npm launcher package
-        if: inputs.npm
+        if: needs.plan.outputs.mode == 'app' && needs.plan.outputs.npm == 'true'
         env:
           ASSETS: ${{ needs.plan.outputs.assets }}
         run: |
@@ -513,7 +625,7 @@ jobs:
         if: inputs.homebrew-tap != '' || inputs.aur-package != ''
         env:
           REPOSITORY: ${{ github.repository }}
-          FORMULA: ${{ inputs.homebrew-formula || inputs.bin }}
+          FORMULA: ${{ inputs.homebrew-formula || needs.plan.outputs.bin }}
           AUR_PACKAGE: ${{ inputs.aur-package }}
           SUMMARY: ${{ needs.plan.outputs.summary }}
           HOMEPAGE: ${{ needs.plan.outputs.homepage }}
@@ -538,13 +650,13 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" "$DIST"/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "$BIN $GITHUB_REF_NAME" \
+            --title "${BIN:-$GITHUB_REPOSITORY} $GITHUB_REF_NAME" \
             --generate-notes \
             --verify-tag
 
   npm:
     name: npm
-    if: inputs.npm && needs.plan.outputs.publish == 'true'
+    if: needs.plan.outputs.npm == 'true' && needs.plan.outputs.publish == 'true'
     needs: [plan, release]
     runs-on: ubuntu-24.04
     environment: ${{ inputs.npm-environment }}
@@ -621,13 +733,14 @@ jobs:
     if: inputs.homebrew-tap != '' && needs.plan.outputs.publish == 'true'
     needs: [plan, release]
     runs-on: ubuntu-24.04
+    environment: ${{ inputs.homebrew-environment }}
     permissions:
       contents: read
     env:
-      BIN: ${{ inputs.bin }}
+      BIN: ${{ needs.plan.outputs.bin }}
       VERSION: ${{ needs.plan.outputs.version }}
       TAP: ${{ inputs.homebrew-tap }}
-      FORMULA: ${{ inputs.homebrew-formula || inputs.bin }}
+      FORMULA: ${{ inputs.homebrew-formula || needs.plan.outputs.bin }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -688,10 +801,11 @@ jobs:
     if: inputs.aur-package != '' && needs.plan.outputs.publish == 'true'
     needs: [plan, release]
     runs-on: ubuntu-24.04
+    environment: ${{ inputs.aur-environment }}
     permissions:
       contents: read
     env:
-      BIN: ${{ inputs.bin }}
+      BIN: ${{ needs.plan.outputs.bin }}
       VERSION: ${{ needs.plan.outputs.version }}
       PACKAGE: ${{ inputs.aur-package }}
     steps:

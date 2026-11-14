@@ -8,6 +8,7 @@
  *   release.mjs rows <targets-json>      the build matrix
  *   release.mjs platform <stage> <asset> <version> <npm-name>
  *   release.mjs main <out> <bin> <version> <asset>...
+ *   release.mjs library <out> <version>
  *   release.mjs formula --name --bin --version --tag --repo --summary --homepage --license --sums
  *   release.mjs aur <dir> --package --bin --version --tag --repo --summary --homepage --license --sums [--maintainer]
  */
@@ -238,10 +239,38 @@ const npmPack = (dir, out) => {
 }
 
 /**
- * Pack the project's own package for npm, with the launcher as its `bin` and
- * one optionalDependencies pin per platform package. The project is packed
- * first exactly as `npm publish` would (its `files` and .npmignore decide what
- * ships), then unpacked, extended and packed again, so the checked-in
+ * Pack the project for npm exactly as `npm publish` would (its `files` and
+ * .npmignore decide what ships), then unpack it, let `extend` change the
+ * unpacked package, and pack that. `private` is dropped: it keeps an
+ * accidental `npm publish` from a checkout out of the registry, and the
+ * release is the deliberate one. The checked-in package.json never changes.
+ */
+const repack = (out, version, extend) => {
+  const manifest = readJson("package.json")
+  if (manifest.version !== version) {
+    fail(`package.json's version is ${manifest.version}, not ${version}`)
+  }
+  fs.mkdirSync(out, { recursive: true })
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "release-npm-"))
+  try {
+    run("tar", ["-xzf", npmPack(".", work), "-C", work])
+    const dir = path.join(work, "package")
+    const packed = readJson(path.join(dir, "package.json"))
+    packed.private = undefined
+    extend(dir, packed)
+    writeJson(path.join(dir, "package.json"), packed)
+    return npmPack(dir, path.resolve(out))
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true })
+  }
+}
+
+/** A library's npm package: the project's source, as `npm publish` would pack it. */
+export const libraryPackage = (out, version) => repack(out, version, () => {})
+
+/**
+ * An app's main npm package: the project with the launcher as its `bin` and
+ * one optionalDependencies pin per platform package, so the checked-in
  * package.json never names a package that is not published yet.
  */
 export const mainPackage = (out, bin, version, assets) => {
@@ -249,9 +278,6 @@ export const mainPackage = (out, bin, version, assets) => {
     fail(`bin "${bin}" is not a command name`)
   }
   const manifest = readJson("package.json")
-  if (manifest.version !== version) {
-    fail(`package.json's version is ${manifest.version}, not ${version}`)
-  }
   if (manifest.optionalDependencies !== undefined) {
     fail("package.json declares optionalDependencies; the release writes the platform pins itself")
   }
@@ -263,21 +289,13 @@ export const mainPackage = (out, bin, version, assets) => {
       fail(`unknown target ${asset}`)
     }
   }
-  fs.mkdirSync(out, { recursive: true })
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), "release-npm-"))
-  try {
-    run("tar", ["-xzf", npmPack(".", work), "-C", work])
-    const dir = path.join(work, "package")
+  return repack(out, version, (dir, packed) => {
     const launcherPath = `bin/${bin}.mjs`
     if (fs.existsSync(path.join(dir, launcherPath))) {
       fail(`the package already ships ${launcherPath}`)
     }
     fs.mkdirSync(path.join(dir, "bin"), { recursive: true })
     fs.writeFileSync(path.join(dir, launcherPath), launcher(manifest.name, bin), { mode: 0o755 })
-    const packed = readJson(path.join(dir, "package.json"))
-    // `private` keeps an accidental `npm publish` from a checkout out of the
-    // registry; the release is the deliberate one.
-    packed.private = undefined
     packed.bin = { [bin]: launcherPath }
     if (Array.isArray(packed.files)) {
       packed.files = [...packed.files, launcherPath]
@@ -285,11 +303,7 @@ export const mainPackage = (out, bin, version, assets) => {
     packed.optionalDependencies = Object.fromEntries(
       [...new Set(assets)].sort().map((asset) => [`${manifest.name}-${asset}`, version])
     )
-    writeJson(path.join(dir, "package.json"), packed)
-    return npmPack(dir, path.resolve(out))
-  } finally {
-    fs.rmSync(work, { recursive: true, force: true })
-  }
+  })
 }
 
 // --- Homebrew -----------------------------------------------------------------
@@ -441,6 +455,7 @@ export const aur = (dir, flags) => {
 const USAGE = `usage: release.mjs rows <targets-json>
        release.mjs platform <stage> <asset> <version> <npm-name>
        release.mjs main <out> <bin> <version> <asset>...
+       release.mjs library <out> <version>
        release.mjs formula --name N --bin B --version V --tag T --repo O/R --summary S --sums FILE [--homepage U] [--license L]
        release.mjs aur <dir> --package P --bin B --version V --tag T --repo O/R --summary S --sums FILE [--homepage U] [--license L] [--maintainer M]`
 
@@ -460,6 +475,9 @@ const cli = (argv) => {
     case "main":
       if (rest.length < 4) break
       return mainPackage(rest[0], rest[1], rest[2], rest.slice(3))
+    case "library":
+      if (rest.length !== 2) break
+      return libraryPackage(rest[0], rest[1])
     case "formula":
       return formula(flags).trimEnd()
     case "aur":

@@ -1,6 +1,6 @@
 # Tests this repository: the packaging tools' unit tests, actionlint over the
-# workflows, and the release workflow itself, run end to end on
-# test/hello on every target with every channel turned on. Off a tag that
+# workflows, and the release workflow itself, run end to end on test/hello as
+# an app on every target with every channel turned on, and as a library. Off a tag that
 # run builds, smoke-tests and packs everything and publishes nothing, and
 # this workflow never runs on a tag, so it cannot publish test/hello.
 
@@ -39,7 +39,7 @@ jobs:
       - name: actionlint
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
 
-  release-dry-run:
+  app-dry-run:
     uses: ./.github/workflows/release.yml
     permissions:
       contents: write
@@ -52,3 +52,14 @@ jobs:
       npm: true
       homebrew-tap: amritk/homebrew-tap
       aur-package: amritk-workflows-hello-bin
+
+  library-dry-run:
+    uses: ./.github/workflows/release.yml
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    with:
+      mode: library
+      directory: test/hello
+      test: nish src/main.ts -o "$RUNNER_TEMP/hello.ll"
