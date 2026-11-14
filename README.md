@@ -22,10 +22,14 @@ A Nish app needs no build configuration: the workflow installs the compiler
 pinned in `.nish-version` and links `src/main.ts`. Other languages give a
 `build` command.
 
+You cut a release by pushing a `v*` tag, or let **release-please** cut them
+from your conventional commits ([Versioning](#versioning)).
+
 Contents: [Use it](#use-it) ·
 [Setting up a repository](#setting-up-a-repository) ·
 [What a release does](#what-a-release-does) ·
 [Versions and prereleases](#versions-and-prereleases) ·
+[Versioning](#versioning) ·
 [Security](#security) · [npm](#npm) · [Homebrew](#homebrew) · [AUR](#aur) ·
 [Private repositories](#private-repositories) · [Hooks](#hooks) ·
 [Inputs](#inputs) · [Verifying a release](#verifying-a-release) ·
@@ -122,7 +126,8 @@ version, and a package.json if it publishes to npm.
 4. **release** gathers every target's files, packs the npm package, writes
    `SHA256SUMS`, checks the Homebrew formula and the PKGBUILD can be written,
    then on a tag signs build provenance for every file and creates the GitHub
-   release, with notes generated from the pull requests since the last one.
+   release, with notes generated from the pull requests since the last one (or
+   adds the files to the release that already exists, such as release-please's).
 5. **npm** downloads the packages from the release, checks them against
    `SHA256SUMS`, and publishes the platform packages first and the main package
    last, skipping any version already on the registry, so a re-run finishes a
@@ -145,6 +150,112 @@ A version with a hyphen, such as `1.2.0-rc.1`, is a **prerelease**: the GitHub
 release is marked as one, npm publishes it under the `next` dist-tag rather
 than `latest` (`npm install <package>@next`), and Homebrew and the AUR are
 skipped, so their users stay on the last full release.
+
+## Versioning
+
+With the default, `versioning: tag`, a person cuts each release by pushing the
+tag. To have [release-please](https://github.com/googleapis/release-please)
+cut them instead, call `release-please.yml` beside `release.yml` in the same
+file, and run it on pushes to the default branch:
+
+```yaml
+# .github/workflows/release.yml
+name: Release
+on:
+  push: { branches: [main], tags: ["v*"] }
+  pull_request: { paths: [.github/workflows/release.yml, .nish-version] }
+  workflow_dispatch:
+permissions: {}
+jobs:
+  release-please:
+    uses: amritk/workflows/.github/workflows/release-please.yml@<commit-sha> # v1.0.0
+    permissions: { contents: write, pull-requests: write, issues: write, actions: write }
+  release:
+    uses: amritk/workflows/.github/workflows/release.yml@<commit-sha> # v1.0.0
+    permissions: { contents: write, id-token: write, attestations: write }
+    with:
+      versioning: release-please
+      npm: true
+```
+
+Neither job needs a condition: `release-please.yml` acts only on a push to the
+default branch, and `release.yml` does nothing on one. Then add release-please's
+two files. `.github/release-please-config.json`:
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "node",
+      "include-component-in-tag": false,
+      "bump-minor-pre-major": true
+    }
+  }
+}
+```
+
+`.github/.release-please-manifest.json`, holding the current version, the one
+in package.json:
+
+```json
+{ ".": "1.2.3" }
+```
+
+From then on:
+
+1. **Every push to the default branch** updates one open release PR: the next
+   version, worked out from the commits since the last release (`fix` is a
+   patch, `feat` a minor, `!` or a `BREAKING CHANGE` footer a major; before
+   1.0, `bump-minor-pre-major` makes a breaking change a minor), with
+   `CHANGELOG.md`, package.json (`release-type: node`) and any `extra-files`
+   bumped.
+2. **Merging the release PR** makes release-please tag `v<version>` and create
+   the GitHub release with that version's changelog as its notes. Then
+   `release-please.yml` starts your workflow file on the tag.
+3. **That run is an ordinary tag release**: `release.yml` builds, attaches its
+   files to the release release-please created (keeping its notes) and
+   publishes. The run's ref is the tag, so an environment limited to `v*` tags
+   admits it, and npm trusted publishing sees your workflow file as always.
+
+release-please tags with `GITHUB_TOKEN`, and an event made with `GITHUB_TOKEN`
+starts no workflow run, except a dispatch. That is why `release-please.yml`
+starts the release itself (`gh workflow run`) and why your file needs
+`workflow_dispatch`. It needs no other token.
+
+`release.yml` checks the config on every run, pull requests included, so a
+mistake stops a pull request rather than a release. It requires one package, at
+`directory`; `include-component-in-tag: false` (release-please's default puts
+the package's name in the tag, and the release runs only on `v<version>`); no
+`include-v-in-tag: false` and no `draft: true`; and the manifest's version equal
+to package.json's.
+
+- **Squash-merge with conventional pull request titles.** release-please reads
+  the commits on the default branch, so the title is what picks the version and
+  writes the changelog. A feature merged as `chore:` ships without a bump.
+- **A version in another file**, such as a constant the program prints for
+  `--version`: list the file in the package's `extra-files` and end its line
+  with the comment `x-release-please-version`. release-please bumps the version
+  on that line.
+- **Checks do not run on the release PR on their own.** release-please opens it
+  with `GITHUB_TOKEN`, which starts no `pull_request` run. If the branch requires
+  status checks, close and reopen the PR to run them, or leave the
+  `release-please--*` branches out of the requirement.
+- **A repository with releases but no tag for the current version** (a version
+  published by hand, say): set `"bootstrap-sha"` in the config to the commit it
+  was released from, so the first release PR starts there.
+- **Prereleases** are release-please's `"prerelease": true` with
+  `"versioning": "prerelease"`; a hyphenated version publishes to npm's `next`
+  as above.
+- **Changesets** is not supported yet; `versioning: changesets` is reserved for
+  it. This workflow releases one package per repository, tagged `v<version>`,
+  and a monorepo releasing several packages needs per-package tags.
+
+`release-please.yml`'s one job holds `contents`, `pull-requests`, `issues` and
+`actions: write`, and only it does: it runs the pinned release-please action and
+`gh workflow run`, none of your code, and reads no secret. Its inputs are
+`config-file` and `manifest-file` (the defaults above) and `directory` (match
+`release.yml`'s).
 
 ## Security
 
@@ -271,6 +382,9 @@ Everything is optional except where noted.
 | Input | Default | What it does |
 | --- | --- | --- |
 | `mode` | `app` | `app` or `library`. |
+| `versioning` | `tag` | `tag`, or `release-please` with `release-please.yml` beside it ([Versioning](#versioning)). |
+| `release-please-config` | `.github/release-please-config.json` | With `versioning: release-please`, the config, from the repository root. |
+| `release-please-manifest` | `.github/.release-please-manifest.json` | With `versioning: release-please`, the manifest, from the repository root. |
 | `bin` | package.json `name`, unscoped | The command, and the binary's file name. |
 | `directory` | `.` | The project's directory, for a repository holding more than one. |
 | `test` | | Shell run once on Linux before anything is built or packed. |
@@ -328,6 +442,9 @@ project that installed the package checks its provenance.
 | --- | --- |
 | needs `id-token: write` from its caller | Give the calling job the three permissions in [Use it](#use-it). A pull request from a fork cannot, so its dry run fails; that is expected. |
 | the tag is vX but package.json's version is Y | Tag the version package.json holds, or bump package.json first. |
+| the release-please config must … / the release-please manifest … | Fix the config or manifest as the message says ([Versioning](#versioning)). |
+| release-please created a release, but its tag is "…", not v&lt;version&gt; | Set `"include-component-in-tag": false`, then delete that release and tag and re-run. |
+| `could not create workflow dispatch event` | Add `workflow_dispatch:` to your workflow file's `on:`, and `actions: write` to the release-please job; then run your workflow on the tag from the Actions tab. |
 | there is no nish-version input and no .nish-version file | Add `.nish-version` holding the nish release, such as `0.39.0`. |
 | `--version` printed "…", which does not name X | Make the program print its version, or set `check-version: false`. |
 | the build wrote no executable at `$OUT` | With `build`, write the binary to exactly `$OUT`. |
@@ -342,8 +459,8 @@ project that installed the package checks its provenance.
 
 A failed release can be re-run from the Actions tab once the cause is fixed:
 `npm` skips versions already published, and the Homebrew and AUR jobs commit
-nothing when the file is unchanged. A GitHub release that already exists makes
-`release` fail; delete it (not the tag) before re-running.
+nothing when the file is unchanged. A GitHub release that already exists is
+kept, notes and all, and gets the files, replacing any from an earlier run.
 
 ## setup-nish on its own
 
@@ -367,8 +484,10 @@ names linked onto `PATH`. Inputs: `version`, `version-file` (default
   'tools/*.test.mjs'` runs its tests.
 - CI runs those tests, actionlint over the workflows, and the release workflow
   itself as a dry run on [`test/hello`](test/hello): once as an app on every
-  target with every channel on, and once as a library. CI never runs on a tag,
-  so it cannot publish `test/hello`.
+  target with every channel on, once as a library, and once as a library with
+  `versioning: release-please`, which checks test/hello's release-please
+  config. CI never runs on a tag, so it cannot publish `test/hello`, and never
+  calls `release-please.yml`, which would open release PRs here.
 - To release this repository, merge to `main` with CI green and push a
   `vX.Y.Z` tag. Callers pin the tag's commit SHA with the tag in a comment, the
   form Dependabot updates.

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "$comment": "CI's release-please dry run checks this config. CI never calls release-please.yml, so nothing releases test/hello.",
+  "packages": {
+    "test/hello": {
+      "release-type": "node",
+      "include-component-in-tag": false,
+      "bump-minor-pre-major": true
+    }
+  }
+}

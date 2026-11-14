@@ -1,0 +1,97 @@
+# Cut versions with release-please, for release.yml to release.
+#
+# On a push to the default branch this keeps one release PR open: the next
+# version, worked out from the conventional commits since the last release,
+# with package.json, the changelog and any `extra-files` bumped. Merging that
+# PR makes release-please tag `v<version>` and create the GitHub release. This
+# workflow then starts the caller's workflow file on that tag, where release.yml
+# (called with `versioning: release-please`) builds, attaches and publishes.
+#
+# Why a dispatch: release-please tags with GITHUB_TOKEN, and an event made with
+# GITHUB_TOKEN starts no workflow run, except a dispatch. The dispatched run's
+# ref is the tag, so an environment limited to `v*` tags admits it, and npm
+# trusted publishing sees the caller's workflow file as it always does.
+#
+# Any other run (a pull request, a tag, a dispatch) skips the job, so a caller
+# lists this beside release.yml with no conditions. README.md, "Versioning",
+# has the setup.
+
+name: release-please
+
+on:
+  workflow_call:
+    inputs:
+      config-file:
+        description: The release-please config, from the repository root.
+        type: string
+        default: .github/release-please-config.json
+      manifest-file:
+        description: The release-please manifest, from the repository root.
+        type: string
+        default: .github/.release-please-manifest.json
+      directory:
+        description: The released package's directory, as release.yml's `directory` input; release-please names its outputs by it.
+        type: string
+        default: .
+
+permissions: {}
+
+jobs:
+  release-please:
+    name: release-please
+    if: github.event_name == 'push' && github.ref_type == 'branch' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    # The release PR's branch, the tag and the GitHub release (contents); the
+    # release PR (pull-requests) and its `autorelease` labels, which go through
+    # the issues API (issues); and dispatching the release run (actions). It runs
+    # none of the caller's code and reads no secret.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    # The release PR is shared state: two merges landing together must not race
+    # to rewrite it, and the last push must be the one that wins.
+    concurrency:
+      group: release-please-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+        id: release
+        with:
+          config-file: ${{ inputs.config-file }}
+          manifest-file: ${{ inputs.manifest-file }}
+          target-branch: ${{ github.ref_name }}
+
+      - name: Release the new tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTPUTS: ${{ toJSON(steps.release.outputs) }}
+          DIRECTORY: ${{ inputs.directory }}
+        run: |
+          # The action prefixes a package's outputs with its path, except the
+          # root package's.
+          path="$(printf '%s' "${DIRECTORY%/}" | sed -e 's#^\./##')"
+          prefix=""
+          if [ -n "$path" ] && [ "$path" != "." ]; then prefix="$path--"; fi
+          created="$(printf '%s' "$OUTPUTS" | jq -r --arg k "${prefix}release_created" '.[$k] // ""')"
+          tag="$(printf '%s' "$OUTPUTS" | jq -r --arg k "${prefix}tag_name" '.[$k] // ""')"
+          if [ "$created" != "true" ]; then
+            echo "no release this time; the release PR is up to date"
+            exit 0
+          fi
+          # v and a digit: a component tag such as vector-v1.2.0 also starts with v.
+          if ! [[ "$tag" =~ ^v[0-9] ]]; then
+            echo "::error::release-please created a release, but its tag is \"$tag\", not v<version>; set \"include-component-in-tag\": false in the config"
+            exit 1
+          fi
+          # The caller's workflow file, the one holding `uses:`, which must
+          # declare `workflow_dispatch`.
+          workflow="$(basename "${GITHUB_WORKFLOW_REF%%@*}")"
+          gh workflow run "$workflow" --repo "$GITHUB_REPOSITORY" --ref "$tag"
+          echo "::notice::started $workflow on $tag, which releases it"
+          {
+            echo "### Released $tag"
+            echo
+            echo "[$workflow]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/workflows/$workflow) is now running on $tag and publishes it."
+          } >> "$GITHUB_STEP_SUMMARY"

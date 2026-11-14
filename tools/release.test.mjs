@@ -15,6 +15,7 @@ import {
   mainPackage,
   parseSums,
   platformPackage,
+  releasePleaseCheck,
   rows,
   tarballName,
 } from "./release.mjs"
@@ -242,5 +243,58 @@ describe("npm", () => {
     assert.equal(manifest.bin, undefined)
     const list = spawnSync("tar", ["-tzf", tarball], { encoding: "utf8" }).stdout
     assert.match(list, /^package\/src\/index.ts$/m)
+  })
+})
+
+describe("releasePleaseCheck", () => {
+  const config = (settings = {}, top = {}) => ({
+    ...top,
+    packages: { ".": { "release-type": "node", "include-component-in-tag": false, ...settings } },
+  })
+
+  it("accepts one package tagged v<version>, and returns its path", () => {
+    assert.equal(releasePleaseCheck(config(), { ".": "0.1.0" }, ".", "0.1.0"), ".")
+  })
+
+  it("reads settings from the top level too", () => {
+    const top = { packages: { ".": {} }, "release-type": "simple", "include-component-in-tag": false }
+    assert.equal(releasePleaseCheck(top, { ".": "1.0.0" }, "."), ".")
+  })
+
+  it("keys a subdirectory as release-please does, without ./ or a trailing slash", () => {
+    const sub = { packages: { "test/hello": { "release-type": "node", "include-component-in-tag": false } } }
+    assert.equal(releasePleaseCheck(sub, { "test/hello": "0.1.0" }, "./test/hello/", "0.1.0"), "test/hello")
+  })
+
+  it("refuses a component in the tag, which is release-please's default", () => {
+    const { "include-component-in-tag": _, ...rest } = config().packages["."]
+    assert.throws(() => releasePleaseCheck({ packages: { ".": rest } }, { ".": "0.1.0" }, "."), /include-component-in-tag/)
+  })
+
+  it("refuses a tag without its v", () => {
+    assert.throws(() => releasePleaseCheck(config({ "include-v-in-tag": false }), { ".": "0.1.0" }, "."), /include-v-in-tag/)
+  })
+
+  it("refuses a draft release, which has no tag", () => {
+    assert.throws(() => releasePleaseCheck(config({ draft: true }), { ".": "0.1.0" }, "."), /draft/)
+  })
+
+  it("refuses a config with no release-type", () => {
+    assert.throws(
+      () => releasePleaseCheck({ packages: { ".": { "include-component-in-tag": false } } }, { ".": "0.1.0" }, "."),
+      /release-type/,
+    )
+  })
+
+  it("refuses more than one package, or one at another path", () => {
+    const two = config()
+    two.packages["packages/b"] = { "release-type": "node" }
+    assert.throws(() => releasePleaseCheck(two, { ".": "0.1.0" }, "."), /one package/)
+    assert.throws(() => releasePleaseCheck(config(), { ".": "0.1.0" }, "test/hello"), /one package, "test\/hello"/)
+  })
+
+  it("refuses a manifest that is missing the package or disagrees with package.json", () => {
+    assert.throws(() => releasePleaseCheck(config(), {}, "."), /manifest has no version/)
+    assert.throws(() => releasePleaseCheck(config(), { ".": "0.1.0" }, ".", "0.2.0"), /0\.1\.0, but package.json's version is 0\.2\.0/)
   })
 })
