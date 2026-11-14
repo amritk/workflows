@@ -1,0 +1,8 @@
+{
+  "name": "@amritk/workflows-hello",
+  "version": "0.1.0",
+  "description": "The program amritk/workflows releases in a dry run to test itself",
+  "license": "MIT",
+  "private": true,
+  "files": ["src"]
+}

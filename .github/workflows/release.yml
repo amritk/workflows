@@ -1,0 +1,752 @@
+# Release a native command-line program: build it on one runner per target,
+# smoke-test every binary, attach the tarballs to a GitHub release with
+# SHA256SUMS and signed build provenance, and publish it through whichever
+# channels the caller turns on: npm, a Homebrew tap, the AUR.
+#
+# Nish programs are built with no build step of their own (`language: nish`,
+# the default); anything else names its build command. README.md has the
+# inputs, the secrets each channel needs and the one-time setup.
+#
+# A run on a `v*` tag releases. Any other run (a pull request, a manual run)
+# builds and smoke-tests every target, and packs every channel's files, but
+# releases and publishes nothing.
+
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      bin:
+        description: The command name, which is also the binary's file name.
+        type: string
+        required: true
+      directory:
+        description: The project's directory in the repository, for a repository holding more than one.
+        type: string
+        default: .
+      language:
+        description: "`nish` installs the Nish toolchain and, with no `build`, links `entry`. `none` installs nothing."
+        type: string
+        default: nish
+      entry:
+        description: The Nish entry point to link, with `language: nish` and no `build`.
+        type: string
+        default: src/main.ts
+      nish-version:
+        description: The nish release to build with. Empty reads `.nish-version` in `directory`.
+        type: string
+        default: ""
+      link-flags:
+        description: Extra flags for `nish <entry> --link`, such as `--profile size`.
+        type: string
+        default: ""
+      setup:
+        description: Shell run before the build on every target, in `directory`, to install what the build needs.
+        type: string
+        default: ""
+      build:
+        description: Shell that builds the binary at `$OUT`, run in `directory` with ASSET and VERSION set. Replaces the Nish link.
+        type: string
+        default: ""
+      targets:
+        description: JSON array of targets to build.
+        type: string
+        default: '["x86_64-linux", "aarch64-linux", "aarch64-darwin", "x86_64-darwin"]'
+      include:
+        description: Space-separated files from `directory` copied beside `bin/` in every release; missing ones are skipped.
+        type: string
+        default: LICENSE README.md THIRD_PARTY_NOTICES.md
+      stage:
+        description: Shell run in `directory` after the build, with STAGE (the release directory), ASSET and VERSION set, to add files beside the binary.
+        type: string
+        default: ""
+      smoke:
+        description: Shell run in an empty directory against BIN, an installed copy of the binary, with REPO set to `directory`.
+        type: string
+        default: ""
+      check-version:
+        description: Require `BIN --version` to print the version being released.
+        type: boolean
+        default: true
+      summary:
+        description: One line describing the program, for Homebrew and the AUR. Empty uses package.json's description.
+        type: string
+        default: ""
+      homepage:
+        description: The program's homepage. Empty uses package.json's homepage, then the repository.
+        type: string
+        default: ""
+      license:
+        description: An SPDX license. Empty uses package.json's license.
+        type: string
+        default: ""
+      npm:
+        description: Publish to npm under package.json's `name`, one package per target plus a launcher package.
+        type: boolean
+        default: false
+      npm-environment:
+        description: The GitHub environment the npm job runs in, which npm trusted publishing names.
+        type: string
+        default: npm
+      homebrew-tap:
+        description: The tap repository (`owner/homebrew-tap`) to write a formula to. Empty skips Homebrew.
+        type: string
+        default: ""
+      homebrew-formula:
+        description: The formula's name. Empty uses `bin`.
+        type: string
+        default: ""
+      aur-package:
+        description: The AUR package to push a PKGBUILD to, such as `mytool-bin`. Empty skips the AUR.
+        type: string
+        default: ""
+      aur-maintainer:
+        description: The PKGBUILD's `# Maintainer:` line, such as `Name <email>`.
+        type: string
+        default: ""
+      node-version:
+        description: The Node that packs and publishes. npm trusted publishing needs the npm it bundles to be 11.5.1 or newer.
+        type: string
+        default: 26.13.1
+    secrets:
+      NPM_TOKEN:
+        description: Only for a package's first npm publish, before trusted publishing can be configured for it.
+        required: false
+      HOMEBREW_TAP_TOKEN:
+        description: A token that can push to `homebrew-tap` (contents read and write).
+        required: false
+      AUR_SSH_KEY:
+        description: The private SSH key of the AUR account that maintains `aur-package`.
+        required: false
+
+permissions: {}
+
+env:
+  # Where this repository is checked out in every job, at the commit the
+  # caller's `uses:` resolved to (see the plan job).
+  WORKFLOWS: ${{ github.workspace }}/_workflows
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: repo/${{ inputs.directory }}
+    outputs:
+      workflows-repository: ${{ steps.self.outputs.repository }}
+      workflows-sha: ${{ steps.self.outputs.sha }}
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      check-version: ${{ steps.plan.outputs.check-version }}
+      nish-version: ${{ steps.plan.outputs.nish-version }}
+      rows: ${{ steps.plan.outputs.rows }}
+      assets: ${{ steps.plan.outputs.assets }}
+      summary: ${{ steps.plan.outputs.summary }}
+      homepage: ${{ steps.plan.outputs.homepage }}
+      license: ${{ steps.plan.outputs.license }}
+      private: ${{ steps.plan.outputs.private }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: repo
+          persist-credentials: false
+
+      # A reusable workflow cannot see which commit of its own repository it
+      # was loaded from; the job's OIDC token can. Every later job checks out
+      # this repository at that commit, so its scripts and actions are the
+      # ones that shipped with the workflow file the caller pinned.
+      - name: Which commit of this workflow is running
+        id: self
+        working-directory: .
+        run: |
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::the release workflow needs \`id-token: write\` from its caller, to learn which commit of itself to run"
+            exit 1
+          fi
+          token="$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=amritk-workflows" | jq -r .value)"
+          claims="$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+')"
+          while [ $(( ${#claims} % 4 )) -ne 0 ]; do claims="$claims="; done
+          claims="$(printf '%s' "$claims" | base64 -d)"
+          ref="$(printf '%s' "$claims" | jq -r .job_workflow_ref)"
+          sha="$(printf '%s' "$claims" | jq -r .job_workflow_sha)"
+          repository="$(printf '%s' "$ref" | cut -d/ -f1-2)"
+          echo "running $ref ($sha)"
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ steps.self.outputs.repository }}
+          ref: ${{ steps.self.outputs.sha }}
+          path: _workflows
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Version, channels and matrix
+        id: plan
+        env:
+          TARGETS: ${{ inputs.targets }}
+          DRY_RUN_EVENT: ${{ github.event_name }}
+          PRIVATE: ${{ github.event.repository.private }}
+          LANGUAGE: ${{ inputs.language }}
+          NISH_VERSION: ${{ inputs.nish-version }}
+          CHECK_VERSION: ${{ inputs.check-version }}
+          NPM: ${{ inputs.npm }}
+          TAP: ${{ inputs.homebrew-tap }}
+          AUR: ${{ inputs.aur-package }}
+          SUMMARY: ${{ inputs.summary }}
+          HOMEPAGE: ${{ inputs.homepage }}
+          LICENSE: ${{ inputs.license }}
+        run: |
+          pkg() { if [ -f package.json ]; then node -p "require('./package.json')$1 ?? ''"; fi; }
+          pkg_version="$(pkg .version)"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [[ "$GITHUB_REF_NAME" == v* ]]; then
+            publish=true
+            version="${GITHUB_REF_NAME#v}"
+            if [ -n "$pkg_version" ] && [ "$pkg_version" != "$version" ]; then
+              echo "::error::the tag is $GITHUB_REF_NAME but package.json's version is $pkg_version"
+              exit 1
+            fi
+            check="$CHECK_VERSION"
+          else
+            publish=false
+            version="${pkg_version:-0.0.0}"
+            check="$CHECK_VERSION"
+            if [ -z "$pkg_version" ]; then check=false; fi
+            echo "::notice::not a v* tag ($DRY_RUN_EVENT on $GITHUB_REF_NAME): building $version on every target and releasing nothing"
+          fi
+
+          if [ "$LANGUAGE" = "nish" ]; then
+            nish="$NISH_VERSION"
+            if [ -z "$nish" ]; then
+              test -f .nish-version || { echo "::error::language is nish but there is no nish-version input and no .nish-version file"; exit 1; }
+              nish="$(tr -d '[:space:]' < .nish-version)"
+            fi
+          elif [ "$LANGUAGE" != "none" ]; then
+            echo "::error::language is \"$LANGUAGE\"; it is nish or none"
+            exit 1
+          fi
+
+          if [ "$NPM" = "true" ] && [ -z "$(pkg .name)" ]; then
+            echo "::error::npm publishes under package.json's name, and there is no package.json with one"
+            exit 1
+          fi
+          private="${PRIVATE:-false}"
+          if [ "$private" = "true" ] && { [ -n "$TAP" ] || [ -n "$AUR" ]; }; then
+            # Homebrew and the AUR download the release's tarballs anonymously.
+            echo "::error::Homebrew and the AUR need a public repository: they download the release tarballs, which a private repository's release does not serve to anyone signed out"
+            exit 1
+          fi
+          summary="${SUMMARY:-$(pkg .description)}"
+          if { [ -n "$TAP" ] || [ -n "$AUR" ]; } && [ -z "$summary" ]; then
+            echo "::error::Homebrew and the AUR need a one-line summary: set the summary input or package.json's description"
+            exit 1
+          fi
+
+          rows="$(node "$WORKFLOWS/tools/release.mjs" rows "$TARGETS")"
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "check-version=$check"
+            echo "nish-version=${nish:-}"
+            echo "rows=$rows"
+            echo "assets=$(printf '%s' "$rows" | jq -r '[.[].asset] | join(" ")')"
+            echo "summary=$summary"
+            echo "homepage=${HOMEPAGE:-$(pkg .homepage)}"
+            echo "license=${LICENSE:-$(pkg .license)}"
+            echo "private=$private"
+          } >> "$GITHUB_OUTPUT"
+          echo "version $version, publish $publish"
+          printf '%s' "$rows" | jq -r '.[] | "\(.asset) on \(.runner)"'
+
+  build:
+    name: build (${{ matrix.target.asset }})
+    needs: plan
+    runs-on: ${{ matrix.target.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.plan.outputs.rows) }}
+    defaults:
+      run:
+        working-directory: repo/${{ inputs.directory }}
+    env:
+      ASSET: ${{ matrix.target.asset }}
+      BIN: ${{ inputs.bin }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      CHECK_VERSION: ${{ needs.plan.outputs.check-version }}
+      REPO: ${{ github.workspace }}/repo/${{ inputs.directory }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: repo
+          persist-credentials: false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ needs.plan.outputs.workflows-repository }}
+          ref: ${{ needs.plan.outputs.workflows-sha }}
+          path: _workflows
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: The runner is the platform the target names
+        env:
+          HOST: ${{ matrix.target.host }}
+        run: |
+          host="$(uname -s)-$(uname -m)"
+          if [ "$host" != "$HOST" ]; then
+            echo "::error::this runner is $host, but $ASSET is built on $HOST"
+            exit 1
+          fi
+
+      - name: Set up Nish
+        if: inputs.language == 'nish'
+        uses: ./_workflows/actions/setup-nish
+        with:
+          version: ${{ needs.plan.outputs.nish-version }}
+
+      - name: Setup hook
+        if: inputs.setup != ''
+        run: ${{ inputs.setup }}
+
+      - name: Build
+        id: build
+        env:
+          BUILD: ${{ inputs.build }}
+          LANGUAGE: ${{ inputs.language }}
+          ENTRY: ${{ inputs.entry }}
+          LINK_FLAGS: ${{ inputs.link-flags }}
+          INCLUDE: ${{ inputs.include }}
+        run: |
+          name="$BIN-$VERSION-$ASSET"
+          stage="$RUNNER_TEMP/release/$name"
+          scratch="$RUNNER_TEMP/link"
+          mkdir -p "$stage/bin" "$scratch" "$RUNNER_TEMP/out"
+          export OUT="$scratch/$BIN"
+          if [ -n "$BUILD" ]; then
+            bash -euo pipefail -c "$BUILD"
+          elif [ "$LANGUAGE" = "nish" ]; then
+            # --link leaves IR and per-module files beside its output, so it
+            # links in a scratch directory and only the binary is staged.
+            # shellcheck disable=SC2086 # LINK_FLAGS is a list of flags
+            nish "$ENTRY" --link "$OUT" $LINK_FLAGS
+          else
+            echo "::error::language is none, so the build input has to say how to build"
+            exit 1
+          fi
+          test -x "$OUT" || { echo "::error::the build wrote no executable at \$OUT ($OUT)"; exit 1; }
+          cp "$OUT" "$stage/bin/$BIN"
+          for f in $INCLUDE; do
+            if [ -e "$f" ]; then cp -R "$f" "$stage/"; fi
+          done
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "stage=$stage" >> "$GITHUB_OUTPUT"
+
+      - name: Stage hook
+        if: inputs.stage != ''
+        env:
+          STAGE: ${{ steps.build.outputs.stage }}
+        run: ${{ inputs.stage }}
+
+      - name: Tarball
+        id: tarball
+        env:
+          NAME: ${{ steps.build.outputs.name }}
+        run: |
+          tarball="$RUNNER_TEMP/out/$NAME.tar.gz"
+          tar -czf "$tarball" -C "$RUNNER_TEMP/release" "$NAME"
+          mkdir -p "$RUNNER_TEMP/unpack" "$RUNNER_TEMP/smoke"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/unpack"
+          echo "bin=$RUNNER_TEMP/unpack/$NAME/bin/$BIN" >> "$GITHUB_OUTPUT"
+          tar -tzvf "$tarball"
+
+      - name: The unpacked binary runs
+        env:
+          UNPACKED: ${{ steps.tarball.outputs.bin }}
+        run: |
+          out="$("$UNPACKED" --version)"
+          echo "$out"
+          if [ "$CHECK_VERSION" = "true" ]; then
+            case "$out" in
+              *"$VERSION"*) ;;
+              *) echo "::error::$BIN --version printed \"$out\", which does not name $VERSION"; exit 1 ;;
+            esac
+          fi
+
+      - name: Smoke the unpacked binary
+        if: inputs.smoke != ''
+        working-directory: ${{ runner.temp }}/smoke
+        env:
+          BIN: ${{ steps.tarball.outputs.bin }}
+        run: ${{ inputs.smoke }}
+
+      - name: npm packages
+        id: npm
+        if: inputs.npm
+        env:
+          STAGE: ${{ steps.build.outputs.stage }}
+          ASSETS: ${{ needs.plan.outputs.assets }}
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          node "$WORKFLOWS/tools/release.mjs" platform "$STAGE" "$ASSET" "$VERSION" "$name" > /dev/null
+          platform="$(npm pack "$STAGE" --pack-destination "$RUNNER_TEMP/out" --ignore-scripts --json | jq -r '.[0].filename')"
+          # The launcher package is packed here only to install it below; the
+          # release job packs the one it publishes.
+          # shellcheck disable=SC2086 # ASSETS is a list
+          main="$(node "$WORKFLOWS/tools/release.mjs" main "$RUNNER_TEMP/try" "$BIN" "$VERSION" $ASSETS)"
+          project="$RUNNER_TEMP/npm-install"
+          mkdir -p "$project"
+          (cd "$project" && npm init -y > /dev/null && npm install --no-audit --no-fund "$RUNNER_TEMP/out/$platform" "$main")
+          echo "platform=$RUNNER_TEMP/out/$platform" >> "$GITHUB_OUTPUT"
+          echo "bin=$project/node_modules/.bin/$BIN" >> "$GITHUB_OUTPUT"
+          out="$("$project/node_modules/.bin/$BIN" --version)"
+          echo "$out"
+          if [ "$CHECK_VERSION" = "true" ]; then
+            case "$out" in
+              *"$VERSION"*) ;;
+              *) echo "::error::the npm-installed $BIN --version printed \"$out\""; exit 1 ;;
+            esac
+          fi
+
+      - name: Smoke the npm-installed command
+        if: inputs.npm && inputs.smoke != ''
+        working-directory: ${{ runner.temp }}/smoke
+        env:
+          BIN: ${{ steps.npm.outputs.bin }}
+        run: ${{ inputs.smoke }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.target.asset }}
+          path: |
+            ${{ runner.temp }}/out/${{ steps.build.outputs.name }}.tar.gz
+            ${{ steps.npm.outputs.platform }}
+          if-no-files-found: error
+          retention-days: 3
+
+  # Packs the release's files and every channel's, publishing nothing unless
+  # this is a tag. On a pull request it is the check that the formula and the
+  # PKGBUILD can still be written.
+  release:
+    name: release
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        working-directory: repo/${{ inputs.directory }}
+    outputs:
+      sums: ${{ steps.sums.outputs.sums }}
+    env:
+      BIN: ${{ inputs.bin }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      DIST: ${{ runner.temp }}/dist
+      PUBLISH: ${{ needs.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: repo
+          persist-credentials: false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ needs.plan.outputs.workflows-repository }}
+          ref: ${{ needs.plan.outputs.workflows-sha }}
+          path: _workflows
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      # Outside the checkout, so packing the project can never pick these up.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/dist
+
+      - name: Every target's tarball is here
+        env:
+          ASSETS: ${{ needs.plan.outputs.assets }}
+        run: |
+          for asset in $ASSETS; do
+            test -s "$DIST/$BIN-$VERSION-$asset.tar.gz" || { echo "::error::no tarball for $asset"; exit 1; }
+          done
+          ls -l "$DIST"
+
+      - name: The npm launcher package
+        if: inputs.npm
+        env:
+          ASSETS: ${{ needs.plan.outputs.assets }}
+        run: |
+          # shellcheck disable=SC2086 # ASSETS is a list
+          node "$WORKFLOWS/tools/release.mjs" main "$DIST" "$BIN" "$VERSION" $ASSETS
+
+      - name: SHA256SUMS
+        id: sums
+        working-directory: ${{ runner.temp }}/dist
+        run: |
+          shopt -s nullglob
+          files=(*.tar.gz *.tgz)
+          sha256sum -- "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+          { echo "sums<<SHA256SUMS_END"; cat SHA256SUMS; echo "SHA256SUMS_END"; } >> "$GITHUB_OUTPUT"
+
+      - name: The Homebrew formula and the AUR package can be written
+        if: inputs.homebrew-tap != '' || inputs.aur-package != ''
+        env:
+          REPOSITORY: ${{ github.repository }}
+          FORMULA: ${{ inputs.homebrew-formula || inputs.bin }}
+          AUR_PACKAGE: ${{ inputs.aur-package }}
+          SUMMARY: ${{ needs.plan.outputs.summary }}
+          HOMEPAGE: ${{ needs.plan.outputs.homepage }}
+          LICENSE: ${{ needs.plan.outputs.license }}
+        run: |
+          common=(--bin "$BIN" --version "$VERSION" --tag "v$VERSION" --repo "$REPOSITORY" --summary "$SUMMARY" --homepage "$HOMEPAGE" --license "$LICENSE" --sums "$DIST/SHA256SUMS")
+          node "$WORKFLOWS/tools/release.mjs" formula --name "$FORMULA" "${common[@]}"
+          if [ -n "$AUR_PACKAGE" ]; then
+            node "$WORKFLOWS/tools/release.mjs" aur "$RUNNER_TEMP/aur-check" --package "$AUR_PACKAGE" "${common[@]}"
+          fi
+
+      - name: Attest build provenance
+        if: needs.plan.outputs.publish == 'true' && needs.plan.outputs.private != 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: ${{ runner.temp }}/dist/SHA256SUMS
+
+      - name: GitHub release
+        if: needs.plan.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$DIST"/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$BIN $GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag
+
+  npm:
+    name: npm
+    if: inputs.npm && needs.plan.outputs.publish == 'true'
+    needs: [plan, release]
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.npm-environment }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: npm new enough for trusted publishing
+        run: |
+          v="$(npm --version)"
+          echo "npm $v"
+          node -e 'const [a, b, c] = process.argv[1].split(".").map(Number); if (a * 1e6 + b * 1e3 + c < 11005001) { console.error(`::error::npm ${process.argv[1]} predates trusted publishing (11.5.1); raise node-version`); process.exit(1) }' "$v"
+
+      - name: The packages the release attached, as attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUMS: ${{ needs.release.outputs.sums }}
+        run: |
+          mkdir -p npm
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern '*.tgz' --dir npm
+          printf '%s\n' "$SUMS" | grep '\.tgz$' > npm/expected.sums
+          (cd npm && sha256sum -c expected.sums)
+
+      - name: Publish, platforms first
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_ENVIRONMENT: ${{ inputs.npm-environment }}
+          PRIVATE: ${{ needs.plan.outputs.private }}
+        run: |
+          if [ -n "$NPM_TOKEN" ]; then
+            # Only for a first publish. npm expands the reference itself, so
+            # the token is never written to disk.
+            # shellcheck disable=SC2016
+            printf '//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n' > "$RUNNER_TEMP/.npmrc"
+            export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/.npmrc"
+          fi
+          provenance=--provenance
+          if [ "$PRIVATE" = "true" ]; then
+            provenance=--no-provenance
+            echo "::notice::a private repository gets no npm provenance"
+          fi
+          main=""
+          order=()
+          for tgz in npm/*.tgz; do
+            if tar -xzOf "$tgz" package/package.json | jq -e '.os' > /dev/null; then
+              order+=("$tgz")
+            else
+              main="$tgz"
+            fi
+          done
+          test -n "$main" || { echo "::error::the release attached no launcher package"; exit 1; }
+          order+=("$main")
+          for tgz in "${order[@]}"; do
+            name="$(tar -xzOf "$tgz" package/package.json | jq -r .name)"
+            if npm view "$name@$VERSION" version > /dev/null 2>&1; then
+              echo "$name@$VERSION is already on the registry; skipping"
+              continue
+            fi
+            if ! npm view "$name" name > /dev/null 2>&1 && [ -z "$NPM_TOKEN" ]; then
+              echo "::error::$name has never been published, so it cannot trust this workflow yet. Pass the NPM_TOKEN secret for its first release, then configure trusted publishing for $GITHUB_REPOSITORY with workflow file $(basename "${GITHUB_WORKFLOW_REF%@*}") and environment $NPM_ENVIRONMENT."
+              exit 1
+            fi
+            npm publish "$tgz" --access public "$provenance"
+          done
+
+  homebrew:
+    name: homebrew
+    if: inputs.homebrew-tap != '' && needs.plan.outputs.publish == 'true'
+    needs: [plan, release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      BIN: ${{ inputs.bin }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      TAP: ${{ inputs.homebrew-tap }}
+      FORMULA: ${{ inputs.homebrew-formula || inputs.bin }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ needs.plan.outputs.workflows-repository }}
+          ref: ${{ needs.plan.outputs.workflows-sha }}
+          path: _workflows
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Write the formula
+        env:
+          SUMS: ${{ needs.release.outputs.sums }}
+          SUMMARY: ${{ needs.plan.outputs.summary }}
+          HOMEPAGE: ${{ needs.plan.outputs.homepage }}
+          LICENSE: ${{ needs.plan.outputs.license }}
+        run: |
+          printf '%s\n' "$SUMS" > "$RUNNER_TEMP/SHA256SUMS"
+          node "$WORKFLOWS/tools/release.mjs" formula --name "$FORMULA" --bin "$BIN" --version "$VERSION" \
+            --tag "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --summary "$SUMMARY" --homepage "$HOMEPAGE" \
+            --license "$LICENSE" --sums "$RUNNER_TEMP/SHA256SUMS" > "$RUNNER_TEMP/formula.rb"
+          cat "$RUNNER_TEMP/formula.rb"
+
+      # Plain git rather than actions/checkout, which cannot check out a tap
+      # that has no commits yet.
+      - name: Push it to the tap
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          test -n "$TOKEN" || { echo "::error::homebrew-tap is set but the HOMEBREW_TAP_TOKEN secret is not"; exit 1; }
+          git init -q tap && cd tap
+          git config http.https://github.com/.extraheader "AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          git remote add origin "https://github.com/$TAP.git"
+          branch="$(git ls-remote --symref origin HEAD | sed -n 's#^ref: refs/heads/\(.*\)\tHEAD$#\1#p')"
+          if [ -n "$branch" ]; then
+            git fetch -q --depth 1 origin "$branch"
+            git checkout -q -B "$branch" FETCH_HEAD
+          else
+            branch=main
+            git checkout -q -b "$branch"
+          fi
+          mkdir -p Formula
+          cp "$RUNNER_TEMP/formula.rb" "Formula/$FORMULA.rb"
+          git add "Formula/$FORMULA.rb"
+          if git diff --cached --quiet; then
+            echo "Formula/$FORMULA.rb is already $VERSION"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "$FORMULA $VERSION" -m "From $GITHUB_REPOSITORY $GITHUB_REF_NAME."
+          git push -q origin "HEAD:$branch"
+          echo "pushed Formula/$FORMULA.rb to $TAP ($branch)"
+
+  aur:
+    name: aur
+    if: inputs.aur-package != '' && needs.plan.outputs.publish == 'true'
+    needs: [plan, release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      BIN: ${{ inputs.bin }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      PACKAGE: ${{ inputs.aur-package }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ needs.plan.outputs.workflows-repository }}
+          ref: ${{ needs.plan.outputs.workflows-sha }}
+          path: _workflows
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Trust aur.archlinux.org by its published host key
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          test -n "$AUR_SSH_KEY" || { echo "::error::aur-package is set but the AUR_SSH_KEY secret is not"; exit 1; }
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur && chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org > "$RUNNER_TEMP/aur.keys" 2> /dev/null
+          want="$(node --input-type=module -e "import { AUR_HOST_KEY } from '$WORKFLOWS/tools/release.mjs'; console.log(AUR_HOST_KEY)")"
+          got="$(ssh-keygen -lf "$RUNNER_TEMP/aur.keys" | awk '{ print $2 }')"
+          if [ "$got" != "$want" ]; then
+            echo "::error::aur.archlinux.org presented host key $got, not the published $want"
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/aur.keys" >> ~/.ssh/known_hosts
+
+      - name: Write the PKGBUILD and push it
+        env:
+          SUMS: ${{ needs.release.outputs.sums }}
+          SUMMARY: ${{ needs.plan.outputs.summary }}
+          HOMEPAGE: ${{ needs.plan.outputs.homepage }}
+          LICENSE: ${{ needs.plan.outputs.license }}
+          MAINTAINER: ${{ inputs.aur-maintainer }}
+        run: |
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          # The AUR serves a package that does not exist yet as an empty
+          # repository, and the first push creates it.
+          git clone -q "ssh://aur@aur.archlinux.org/$PACKAGE.git" aur
+          printf '%s\n' "$SUMS" > "$RUNNER_TEMP/SHA256SUMS"
+          maintainer=()
+          if [ -n "$MAINTAINER" ]; then maintainer=(--maintainer "$MAINTAINER"); fi
+          node "$WORKFLOWS/tools/release.mjs" aur aur --package "$PACKAGE" --bin "$BIN" --version "$VERSION" \
+            --tag "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --summary "$SUMMARY" --homepage "$HOMEPAGE" \
+            --license "$LICENSE" --sums "$RUNNER_TEMP/SHA256SUMS" "${maintainer[@]}"
+          cd aur
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "$PACKAGE is already $VERSION"
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "$VERSION" -m "From $GITHUB_REPOSITORY $GITHUB_REF_NAME."
+          git push -q origin HEAD:master
+          echo "pushed $PACKAGE $VERSION to the AUR"

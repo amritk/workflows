@@ -1,0 +1,80 @@
+name: Set up Nish
+description: >-
+  Install a pinned Nish compiler and the C toolchain it links with, and put
+  `nish` on PATH. The version is the `version` input, or else the repository's
+  `.nish-version` file.
+  Works on the GitHub-hosted Linux and macOS runners.
+
+inputs:
+  version:
+    description: The nish release to install, such as 0.39.0. Empty reads `version-file`.
+    required: false
+    default: ""
+  version-file:
+    description: The file holding the version when `version` is empty, relative to the workspace.
+    required: false
+    default: .nish-version
+
+outputs:
+  version:
+    description: The nish version installed.
+    value: ${{ steps.pin.outputs.version }}
+  nish:
+    description: The absolute path of the installed `nish`.
+    value: ${{ steps.install.outputs.nish }}
+
+runs:
+  using: composite
+  steps:
+    - name: Which nish
+      id: pin
+      shell: bash
+      env:
+        WANT: ${{ inputs.version }}
+        FILE: ${{ inputs.version-file }}
+      run: |
+        version="$WANT"
+        if [ -z "$version" ]; then
+          if [ ! -f "$FILE" ]; then
+            echo "::error::setup-nish was given no version and there is no $FILE"
+            exit 1
+          fi
+          version="$(tr -d '[:space:]' < "$FILE")"
+        fi
+        # install.sh refuses anything else too; failing here names the input.
+        if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+          echo "::error::nish version \"$version\" is not a release version like 0.39.0"
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "dir=$RUNNER_TEMP/nish-$version" >> "$GITHUB_OUTPUT"
+
+    # nish emits LLVM IR and runs clang to link it. Ubuntu's clang-18 packages
+    # install only versioned commands, so the plain names are linked onto
+    # PATH. macOS links with Xcode's clang, which every GitHub macOS image has.
+    - name: LLVM 18 (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq clang-18 lld-18 llvm-18
+        bin="$RUNNER_TEMP/llvm-bin"
+        mkdir -p "$bin"
+        for tool in clang llc opt llvm-as ld.lld; do
+          ln -sf "/usr/bin/$tool-18" "$bin/$tool"
+        done
+        echo "$bin" >> "$GITHUB_PATH"
+
+    - name: Install nish ${{ steps.pin.outputs.version }}
+      id: install
+      shell: bash
+      env:
+        VERSION: ${{ steps.pin.outputs.version }}
+        DIR: ${{ steps.pin.outputs.dir }}
+      run: |
+        # The installer comes from the release's own tag, so it is pinned too.
+        curl -fsSL --retry 3 "https://raw.githubusercontent.com/amritk/nish/v$VERSION/install.sh" |
+          sh -s -- "$VERSION" --dir "$DIR" --force --no-modify-path
+        test "$("$DIR/bin/nish" --version | head -n 1 | cut -d' ' -f1-2)" = "nish $VERSION"
+        echo "$DIR/bin" >> "$GITHUB_PATH"
+        echo "nish=$DIR/bin/nish" >> "$GITHUB_OUTPUT"
