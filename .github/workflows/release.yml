@@ -812,7 +812,9 @@ jobs:
               echo "::error::$name has never been published, so it cannot trust this workflow yet. Pass the NPM_TOKEN secret for its first release, then configure trusted publishing for $GITHUB_REPOSITORY with workflow file $(basename "${GITHUB_WORKFLOW_REF%@*}") and environment $NPM_ENVIRONMENT."
               exit 1
             fi
-            npm publish "$tgz" --access public --tag "$dist_tag" "$provenance"
+            # ./ makes npm read a file: npm/<name>.tgz alone is GitHub's
+            # owner/repo shorthand, which npm tries to clone over ssh.
+            npm publish "./$tgz" --access public --tag "$dist_tag" "$provenance"
           done
 
   homebrew:

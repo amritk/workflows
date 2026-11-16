@@ -345,4 +345,13 @@ describe("release.yml", () => {
       assert.match(job.if, /^!cancelled\(\) && needs\.release\.result == 'success' && /, name)
     }
   })
+  // npm reads `npm publish npm/<name>.tgz` as GitHub's owner/repo shorthand and
+  // tries to clone github.com/npm/<name>.tgz over ssh: vector's v0.2.1 failed
+  // that way. A path npm reads as a file starts with ./, / or ~/.
+  it("publishes each tarball by a path npm reads as a file", () => {
+    const file = path.join(import.meta.dirname, "../.github/workflows/release.yml")
+    const publishes = fs.readFileSync(file, "utf8").split("\n").filter((line) => /^\s*npm publish /.test(line))
+    assert.ok(publishes.length > 0)
+    for (const line of publishes) assert.match(line, /^\s*npm publish "(\.\/|\/|~\/)/, line.trim())
+  })
 })
