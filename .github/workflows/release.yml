@@ -731,7 +731,13 @@ jobs:
 
   npm:
     name: npm
-    if: needs.plan.outputs.npm == 'true' && needs.plan.outputs.publish == 'true'
+    # A job's `if` without a status function is `success() && …`, and success()
+    # fails when any job upstream was skipped: in library mode that is build, two
+    # jobs up, so it would never run. Gate on release, which already decided
+    # whether build's result lets the release go ahead.
+    if: >-
+      !cancelled() && needs.release.result == 'success'
+      && needs.plan.outputs.npm == 'true' && needs.plan.outputs.publish == 'true'
     needs: [plan, release]
     runs-on: ubuntu-24.04
     environment: ${{ inputs.npm-environment }}
@@ -811,7 +817,10 @@ jobs:
 
   homebrew:
     name: homebrew
-    if: inputs.homebrew-tap != '' && needs.plan.outputs.publish == 'true' && needs.plan.outputs.prerelease != 'true'
+    # Gated on release's result, as npm is.
+    if: >-
+      !cancelled() && needs.release.result == 'success'
+      && inputs.homebrew-tap != '' && needs.plan.outputs.publish == 'true' && needs.plan.outputs.prerelease != 'true'
     needs: [plan, release]
     runs-on: ubuntu-24.04
     environment: ${{ inputs.homebrew-environment }}
@@ -879,7 +888,10 @@ jobs:
 
   aur:
     name: aur
-    if: inputs.aur-package != '' && needs.plan.outputs.publish == 'true' && needs.plan.outputs.prerelease != 'true'
+    # Gated on release's result, as npm is.
+    if: >-
+      !cancelled() && needs.release.result == 'success'
+      && inputs.aur-package != '' && needs.plan.outputs.publish == 'true' && needs.plan.outputs.prerelease != 'true'
     needs: [plan, release]
     runs-on: ubuntu-24.04
     environment: ${{ inputs.aur-environment }}
