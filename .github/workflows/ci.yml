@@ -1,6 +1,7 @@
 # Tests this repository: the packaging tools' unit tests, actionlint over the
 # workflows, and the release workflow itself, run end to end on test/hello as
-# an app on every target with every channel turned on, as a library, and as a
+# an app on every target (and as a wasm32-wasi module) with every channel
+# turned on, as a library, and as a
 # library versioned by release-please (its config checked). Off a tag that
 # run builds, smoke-tests and packs everything and publishes nothing, and
 # this workflow never runs on a tag, so it cannot publish test/hello.
@@ -53,6 +54,7 @@ jobs:
       npm: true
       homebrew-tap: amritk/homebrew-tap
       aur-package: amritk-workflows-hello-bin
+      wasm: true
 
   library-dry-run:
     uses: ./.github/workflows/release.yml

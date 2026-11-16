@@ -3,7 +3,10 @@
 #   app      build a native program on one runner per target, smoke-test every
 #            binary, attach the tarballs to a GitHub release with SHA256SUMS and
 #            signed build provenance, and publish it through the channels the
-#            caller turns on: npm, a Homebrew tap, the AUR.
+#            caller turns on: npm, a Homebrew tap, the AUR. With `wasm`, it
+#            also links the program as one `wasm32-wasi` module, runs it
+#            under node's WASI, attaches it, and publishes it to npm as a
+#            package that runs the command wherever node runs.
 #   library  pack the package's source (a Nish library ships as source), attach
 #            it to a GitHub release with provenance, and publish it to npm.
 #
@@ -78,6 +81,18 @@ on:
         default: ""
       build:
         description: Shell that builds the binary at `$OUT`, run in `directory` with ASSET and VERSION set. Replaces the Nish link.
+        type: string
+        default: ""
+      wasm:
+        description: "In app mode, also build the program as a `wasm32-wasi` module: attached to the release, and with `npm`, published as `<name>-wasm32-wasi`, which runs the command on any platform node runs on."
+        type: boolean
+        default: false
+      wasm-build:
+        description: Shell that builds the `wasm32-wasi` module at `$OUT`, run in `directory` on Linux with VERSION set. Replaces the Nish `--profile wasi` link; required with `language` none.
+        type: string
+        default: ""
+      wasm-link-flags:
+        description: Extra flags for `nish <entry> --link <module> --profile wasi`. `link-flags` are not passed, since a native profile would replace `wasi`.
         type: string
         default: ""
       targets:
@@ -186,6 +201,8 @@ jobs:
       mode: ${{ steps.plan.outputs.mode }}
       bin: ${{ steps.plan.outputs.bin }}
       npm: ${{ steps.plan.outputs.npm }}
+      npm-name: ${{ steps.plan.outputs.npm-name }}
+      wasm: ${{ steps.plan.outputs.wasm }}
       version: ${{ steps.plan.outputs.version }}
       publish: ${{ steps.plan.outputs.publish }}
       versioning: ${{ steps.plan.outputs.versioning }}
@@ -255,6 +272,7 @@ jobs:
           NISH_VERSION: ${{ inputs.nish-version }}
           CHECK_VERSION: ${{ inputs.check-version }}
           NPM: ${{ inputs.npm }}
+          WASM: ${{ inputs.wasm }}
           TAP: ${{ inputs.homebrew-tap }}
           AUR: ${{ inputs.aur-package }}
           SUMMARY: ${{ inputs.summary }}
@@ -275,6 +293,10 @@ jobs:
             NPM=true
             if [ -n "$TAP" ] || [ -n "$AUR" ]; then
               echo "::error::a library ships to npm only; Homebrew and the AUR install programs, so use mode app"
+              exit 1
+            fi
+            if [ "$WASM" = "true" ]; then
+              echo "::error::wasm builds a program as a wasm32-wasi module, so it needs mode app; a Nish library ships as source"
               exit 1
             fi
           fi
@@ -359,6 +381,8 @@ jobs:
             echo "mode=$MODE"
             echo "bin=$bin"
             echo "npm=$NPM"
+            echo "npm-name=$(pkg .name)"
+            echo "wasm=$WASM"
             echo "version=$version"
             echo "publish=$publish"
             echo "versioning=$versioning_run"
@@ -376,6 +400,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "$MODE $bin $version, publish $publish"
           if [ "$MODE" = "app" ]; then printf '%s' "$rows" | jq -r '.[] | "\(.asset) on \(.runner)"'; fi
+          if [ "$WASM" = "true" ]; then echo "wasm32-wasi on ubuntu-24.04"; fi
 
   # The caller's own checks, once, before anything is built or packed. Holds
   # no secret. Skipped on a push release-please.yml handles.
@@ -596,16 +621,172 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # With `wasm`: the program as one wasm32-wasi module, linked on Linux and
+  # checked as a native binary is, run under node's WASI through the command
+  # its npm package installs. Holds no secret, as build does.
+  wasm:
+    name: build (wasm32-wasi)
+    if: needs.plan.outputs.mode == 'app' && needs.plan.outputs.wasm == 'true'
+    needs: [plan, check]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: repo/${{ inputs.directory }}
+    env:
+      ASSET: wasm32-wasi
+      BIN: ${{ needs.plan.outputs.bin }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      CHECK_VERSION: ${{ needs.plan.outputs.check-version }}
+      REPO: ${{ github.workspace }}/repo/${{ inputs.directory }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: repo
+          persist-credentials: false
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ needs.plan.outputs.workflows-repository }}
+          ref: ${{ needs.plan.outputs.workflows-sha }}
+          path: _workflows
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Set up Nish
+        if: inputs.language == 'nish'
+        uses: ./_workflows/actions/setup-nish
+        with:
+          version: ${{ needs.plan.outputs.nish-version }}
+          wasi: true
+
+      - name: Setup hook
+        if: inputs.setup != ''
+        run: ${{ inputs.setup }}
+
+      - name: Build
+        id: build
+        env:
+          WASM_BUILD: ${{ inputs.wasm-build }}
+          LANGUAGE: ${{ inputs.language }}
+          ENTRY: ${{ inputs.entry }}
+          WASM_LINK_FLAGS: ${{ inputs.wasm-link-flags }}
+          INCLUDE: ${{ inputs.include }}
+          NPM_NAME: ${{ needs.plan.outputs.npm-name }}
+        run: |
+          module="$RUNNER_TEMP/out/$BIN-$VERSION-$ASSET.wasm"
+          stage="$RUNNER_TEMP/release/$ASSET"
+          scratch="$RUNNER_TEMP/link"
+          mkdir -p "$stage" "$scratch" "$RUNNER_TEMP/out" "$RUNNER_TEMP/smoke"
+          export OUT="$scratch/$BIN.wasm"
+          if [ -n "$WASM_BUILD" ]; then
+            bash -euo pipefail -c "$WASM_BUILD"
+          elif [ "$LANGUAGE" = "nish" ]; then
+            # As in build, the link's IR stays in the scratch directory.
+            # shellcheck disable=SC2086 # WASM_LINK_FLAGS is a list of flags
+            nish "$ENTRY" --link "$OUT" --profile wasi $WASM_LINK_FLAGS
+          else
+            echo "::error::language is none, so the wasm-build input has to say how to build the module"
+            exit 1
+          fi
+          test -s "$OUT" || { echo "::error::the wasm build wrote no module at \$OUT ($OUT)"; exit 1; }
+          cp "$OUT" "$module"
+          for f in $INCLUDE; do
+            if [ -e "$f" ]; then cp -R "$f" "$stage/"; fi
+          done
+          # Writes the module and its command into the stage, refusing a file
+          # that is not WebAssembly. With no package.json, the bin names it.
+          node "$WORKFLOWS/tools/release.mjs" wasm "$stage" "$OUT" "$BIN" "$VERSION" "${NPM_NAME:-$BIN}" > /dev/null
+          ls -l "$module"
+          echo "module=$module" >> "$GITHUB_OUTPUT"
+          echo "stage=$stage" >> "$GITHUB_OUTPUT"
+          echo "bin=$stage/bin/$BIN.mjs" >> "$GITHUB_OUTPUT"
+
+      - name: The module runs under node
+        env:
+          RUNNER: ${{ steps.build.outputs.bin }}
+        run: |
+          out="$("$RUNNER" --version)"
+          echo "$out"
+          if [ "$CHECK_VERSION" = "true" ]; then
+            case "$out" in
+              *"$VERSION"*) ;;
+              *) echo "::error::the wasm $BIN --version printed \"$out\", which does not name $VERSION"; exit 1 ;;
+            esac
+          fi
+
+      - name: Smoke the module
+        if: inputs.smoke != ''
+        working-directory: ${{ runner.temp }}/smoke
+        env:
+          BIN: ${{ steps.build.outputs.bin }}
+        run: ${{ inputs.smoke }}
+
+      - name: npm package
+        id: npm
+        if: needs.plan.outputs.npm == 'true'
+        env:
+          STAGE: ${{ steps.build.outputs.stage }}
+          ASSETS: ${{ needs.plan.outputs.assets }}
+        run: |
+          package="$(npm pack "$STAGE" --pack-destination "$RUNNER_TEMP/out" --ignore-scripts --json | jq -r '.[0].filename')"
+          # Installed on its own, as `npm install -g <name>-wasm32-wasi` would.
+          alone="$RUNNER_TEMP/npm-wasm"
+          mkdir -p "$alone"
+          (cd "$alone" && npm init -y > /dev/null && npm install --no-audit --no-fund "$RUNNER_TEMP/out/$package")
+          # And beside the launcher with no platform package, which it falls
+          # back to. The launcher is packed here only to try it.
+          # shellcheck disable=SC2086 # ASSETS is a list
+          main="$(node "$WORKFLOWS/tools/release.mjs" main "$RUNNER_TEMP/try" "$BIN" "$VERSION" $ASSETS "$ASSET")"
+          beside="$RUNNER_TEMP/npm-fallback"
+          mkdir -p "$beside"
+          (cd "$beside" && npm init -y > /dev/null && npm install --no-audit --no-fund --omit=optional "$RUNNER_TEMP/out/$package" "$main")
+          name="$(node -p "require('./package.json').name")"
+          for command in "$alone/node_modules/.bin/$BIN" "$beside/node_modules/$name/bin/$BIN.mjs"; do
+            out="$("$command" --version)"
+            echo "$command: $out"
+            if [ "$CHECK_VERSION" = "true" ]; then
+              case "$out" in
+                *"$VERSION"*) ;;
+                *) echo "::error::$command --version printed \"$out\""; exit 1 ;;
+              esac
+            fi
+          done
+          echo "package=$RUNNER_TEMP/out/$package" >> "$GITHUB_OUTPUT"
+          echo "bin=$alone/node_modules/.bin/$BIN" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke the npm-installed command
+        if: needs.plan.outputs.npm == 'true' && inputs.smoke != ''
+        working-directory: ${{ runner.temp }}/smoke
+        env:
+          BIN: ${{ steps.npm.outputs.bin }}
+        run: ${{ inputs.smoke }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-wasm32-wasi
+          path: |
+            ${{ steps.build.outputs.module }}
+            ${{ steps.npm.outputs.package }}
+          if-no-files-found: error
+          retention-days: 3
+
   # Packs the release's files and every channel's, publishing nothing unless
   # this is a tag. On a pull request it is the check that the formula and the
   # PKGBUILD can still be written.
   release:
     name: release
-    # A library has no build job; it is skipped, not failed.
+    # A library has no build job, and an app without `wasm` no wasm job; each
+    # is skipped then, not failed.
     if: >-
       !cancelled() && needs.plan.result == 'success' && needs.check.result == 'success'
       && (needs.build.result == 'success' || (needs.build.result == 'skipped' && needs.plan.outputs.mode == 'library'))
-    needs: [plan, check, build]
+      && (needs.wasm.result == 'success' || (needs.wasm.result == 'skipped' && needs.plan.outputs.wasm != 'true'))
+    needs: [plan, check, build, wasm]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -620,6 +801,7 @@ jobs:
       BIN: ${{ needs.plan.outputs.bin }}
       VERSION: ${{ needs.plan.outputs.version }}
       PUBLISH: ${{ needs.plan.outputs.publish }}
+      WASM: ${{ needs.plan.outputs.wasm }}
     steps:
       # A job's env cannot read the runner context, so DIST is set here.
       - name: Where the release's files gather
@@ -658,6 +840,9 @@ jobs:
           for asset in $ASSETS; do
             test -s "$DIST/$BIN-$VERSION-$asset.tar.gz" || { echo "::error::no tarball for $asset"; exit 1; }
           done
+          if [ "$WASM" = "true" ]; then
+            test -s "$DIST/$BIN-$VERSION-wasm32-wasi.wasm" || { echo "::error::no wasm32-wasi module"; exit 1; }
+          fi
           ls -l "$DIST"
 
       - name: The library's npm package
@@ -670,6 +855,8 @@ jobs:
         env:
           ASSETS: ${{ needs.plan.outputs.assets }}
         run: |
+          # wasm32-wasi turns on the launcher's fallback to the wasm package.
+          if [ "$WASM" = "true" ]; then ASSETS="$ASSETS wasm32-wasi"; fi
           # shellcheck disable=SC2086 # ASSETS is a list
           node "$WORKFLOWS/tools/release.mjs" main "$DIST" "$BIN" "$VERSION" $ASSETS
 
@@ -678,7 +865,7 @@ jobs:
         working-directory: ${{ runner.temp }}/dist
         run: |
           shopt -s nullglob
-          files=(*.tar.gz *.tgz)
+          files=(*.tar.gz *.tgz *.wasm)
           sha256sum -- "${files[@]}" > SHA256SUMS
           cat SHA256SUMS
           { echo "sums<<SHA256SUMS_END"; cat SHA256SUMS; echo "SHA256SUMS_END"; } >> "$GITHUB_OUTPUT"
@@ -774,6 +961,7 @@ jobs:
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_ENVIRONMENT: ${{ inputs.npm-environment }}
+          NPM_NAME: ${{ needs.plan.outputs.npm-name }}
           PRIVATE: ${{ needs.plan.outputs.private }}
           PRERELEASE: ${{ needs.plan.outputs.prerelease }}
         run: |
@@ -791,16 +979,19 @@ jobs:
           fi
           dist_tag=latest
           if [ "$PRERELEASE" = "true" ]; then dist_tag=next; fi
+          # Every package the main one names (the platforms, and the wasm
+          # package its launcher falls back to) first, so the main package is
+          # never on the registry before them.
           main=""
           order=()
           for tgz in npm/*.tgz; do
-            if tar -xzOf "$tgz" package/package.json | jq -e '.os' > /dev/null; then
-              order+=("$tgz")
-            else
+            if [ "$(tar -xzOf "$tgz" package/package.json | jq -r .name)" = "$NPM_NAME" ]; then
               main="$tgz"
+            else
+              order+=("$tgz")
             fi
           done
-          test -n "$main" || { echo "::error::the release attached no launcher package"; exit 1; }
+          test -n "$main" || { echo "::error::the release attached no $NPM_NAME package"; exit 1; }
           order+=("$main")
           for tgz in "${order[@]}"; do
             name="$(tar -xzOf "$tgz" package/package.json | jq -r .name)"

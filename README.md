@@ -13,7 +13,10 @@ It has two modes:
   - **npm**: `npm install -g <package>` installs the binary for the machine
     (one package per target plus a launcher);
   - **Homebrew**: a formula in your tap, for macOS and Linux;
-  - **AUR**: a `-bin` package.
+  - **AUR**: a `-bin` package;
+  - with `wasm`, a **`wasm32-wasi` module** too: attached to the release, and
+    on npm as a package that runs the same command on any platform Node runs
+    on ([WebAssembly](#webassembly)).
 - **`library`** ships the package's source to npm and to a GitHub release with
   provenance. A [Nish](https://github.com/amritk/nish) library is published as
   source, so nothing is built.
@@ -30,7 +33,8 @@ Contents: [Use it](#use-it) ·
 [What a release does](#what-a-release-does) ·
 [Versions and prereleases](#versions-and-prereleases) ·
 [Versioning](#versioning) ·
-[Security](#security) · [npm](#npm) · [Homebrew](#homebrew) · [AUR](#aur) ·
+[Security](#security) · [npm](#npm) · [WebAssembly](#webassembly) ·
+[Homebrew](#homebrew) · [AUR](#aur) ·
 [Private repositories](#private-repositories) · [Hooks](#hooks) ·
 [Inputs](#inputs) · [Verifying a release](#verifying-a-release) ·
 [Troubleshooting](#troubleshooting) ·
@@ -106,6 +110,7 @@ version, and a package.json if it publishes to npm.
 | `plan` | Linux | read the repository; request an OIDC token | no | none |
 | `check` | Linux | read the repository | `test` | none |
 | `build` | one runner per target | read the repository | `setup`, `build`, `stage`, `smoke` | none |
+| `wasm` | Linux, with `wasm` | read the repository | `setup`, `wasm-build`, `smoke` | none |
 | `release` | Linux | write releases; sign attestations | no | none |
 | `npm` | Linux, environment `npm` | request an OIDC token | no | `NPM_TOKEN`, first publish only |
 | `homebrew` | Linux, environment `homebrew` | read | no | `HOMEBREW_TAP_TOKEN` |
@@ -123,20 +128,26 @@ version, and a package.json if it publishes to npm.
    `<bin> --version`, and runs `smoke`. With npm on, it also packs the platform
    package and the launcher package, installs both into an empty project, and
    runs the version check and `smoke` again through the installed command.
-4. **release** gathers every target's files, packs the npm package, writes
+4. **wasm** (app mode with `wasm`), on Linux: installs Nish with the WASI
+   sysroot, runs `setup`, links the `wasm32-wasi` module (or runs
+   `wasm-build`), and checks `<bin> --version` and runs `smoke` through the
+   command its npm package installs, under Node's WASI. With npm on, it packs
+   that package and checks the command installed on its own and through the
+   launcher.
+5. **release** gathers every target's files, packs the npm package, writes
    `SHA256SUMS`, checks the Homebrew formula and the PKGBUILD can be written,
    then on a tag signs build provenance for every file and creates the GitHub
    release, with notes generated from the pull requests since the last one (or
    adds the files to the release that already exists, such as release-please's).
-5. **npm** downloads the packages from the release, checks them against
-   `SHA256SUMS`, and publishes the platform packages first and the main package
-   last, skipping any version already on the registry, so a re-run finishes a
+6. **npm** downloads the packages from the release, checks them against
+   `SHA256SUMS`, and publishes the platform packages (and the wasm package)
+   first and the main package last, skipping any version already on the registry, so a re-run finishes a
    half-done publish.
-6. **homebrew** writes the formula and commits it to the tap.
-7. **aur** writes the PKGBUILD and `.SRCINFO` and pushes them to the AUR.
+7. **homebrew** writes the formula and commits it to the tap.
+8. **aur** writes the PKGBUILD and `.SRCINFO` and pushes them to the AUR.
 
-Steps 4 to 7 publish only on a tag; on any other run, step 4 stops after the
-checks and 5 to 7 are skipped. If a job fails, nothing after it runs, so a
+Steps 5 to 8 publish only on a tag; on any other run, step 5 stops after the
+checks and 6 to 8 are skipped. If a job fails, nothing after it runs, so a
 build that fails on one target publishes nothing anywhere.
 
 ## Versions and prereleases
@@ -292,7 +303,9 @@ writes both and refuses a package.json that has them.
 
 The launcher runs the platform's binary by its absolute path and passes its
 exit code through. On a machine with no published binary, or an install made
-with `--omit=optional`, it says which package is missing and exits 2.
+with `--omit=optional`, it says which package is missing and exits 2; with
+`wasm`, it first runs `<name>-wasm32-wasi` if that is installed, and otherwise
+names it as the package to install ([WebAssembly](#webassembly)).
 
 In library mode the project is packed exactly as `npm publish` would pack it,
 minus `private`.
@@ -303,10 +316,56 @@ uses a token:
 1. Create a granular npm token that can publish, store it as `NPM_TOKEN` in the
    `npm` environment, and release.
 2. On npmjs.com, for every package the release published (in app mode, the
-   main package and each `<name>-<target>`), add a trusted publisher: your
+   main package, each `<name>-<target>`, and `<name>-wasm32-wasi` with
+   `wasm`), add a trusted publisher: your
    repository, **your** workflow file (`release.yml`, the file that has
    `uses:`, not this repository's), and the environment `npm`.
 3. Delete `NPM_TOKEN`. Every later release publishes through OIDC.
+
+## WebAssembly
+
+With `wasm: true`, an app is also linked as one `wasm32-wasi` module and
+shipped beside the native binaries, the way
+[scalar/formatters](https://github.com/scalar/formatters) ships real tools as
+WebAssembly that needs nothing but Node:
+
+- The release attaches `<bin>-<version>-wasm32-wasi.wasm`, listed in
+  `SHA256SUMS` and covered by the build provenance. Any WASI host runs it:
+  `wasmtime tool-1.2.3-wasm32-wasi.wasm --version`.
+- With `npm`, `<name>-wasm32-wasi` is published as well.
+  `npm install -g <name>-wasm32-wasi` installs the same `<bin>` command on
+  any platform Node 20 or newer runs on, Windows and unusual CPUs included.
+  It runs the module under Node's built-in WASI, with the arguments,
+  environment, standard streams and exit status the native binary has. The
+  package exports the module as `<name>-wasm32-wasi/wasm`, for a host of your
+  own, such as a page or a worker with a WASI shim.
+
+The main package does not depend on the wasm package, so a machine that has a
+prebuilt binary never downloads the module. The launcher prefers the native
+binary. When no platform package is installed (an unsupported platform, or
+`--omit=optional`) it runs `<name>-wasm32-wasi` under the same `node` if that
+is installed, and otherwise tells the user to install it.
+
+A Nish app needs no other configuration: the `wasm` job installs the WASI
+sysroot and runs `nish <entry> --link <module> --profile wasi` with
+`wasm-link-flags`. `link-flags` are not passed, because a native profile such
+as `--profile size` would replace `wasi`. Other languages give `wasm-build`,
+which writes the module to `$OUT` (for example, `cargo build --release
+--target wasm32-wasip1` followed by a copy).
+
+How the module differs from a native binary:
+
+- It sees the working directory and what is below it, and nothing else. An
+  absolute path, or one that climbs out with `..`, does not resolve. Node's
+  WASI preopens `.`, as nish's own WASI host does.
+- It is built once, on Linux, so `setup` runs there too, with `ASSET` set to
+  `wasm32-wasi`. `stage` does not run, because a module cannot read files
+  beside itself. The `include` files go into the npm package.
+- The program has to build under nish's `wasi` profile; see nish's
+  [interop guide](https://github.com/amritk/nish/blob/main/docs/guide/using-nish/interop.md).
+
+Node's WASI is not a security boundary, so the wasm build is not a sandbox
+for code you do not trust.
 
 ## Homebrew
 
@@ -365,14 +424,16 @@ run only in jobs that hold no secret.
 | Hook | When | Where | Variables |
 | --- | --- | --- | --- |
 | `test` | once, on Linux, before anything else | `directory` | `nish` on `PATH` when pinned |
-| `setup` | on every target, before the build | `directory` | `ASSET`, `VERSION`, `BIN` (the name), `REPO` |
+| `setup` | on every target (and the wasm build), before the build | `directory` | `ASSET`, `VERSION`, `BIN` (the name), `REPO` |
 | `build` | on every target, instead of the Nish link | `directory` | as `setup`, plus `OUT`: write the executable there |
+| `wasm-build` | in the wasm build, instead of the Nish `wasi` link | `directory` | as `setup`, plus `OUT`: write the `wasm32-wasi` module there |
 | `stage` | on every target, after the build | `directory` | as `setup`, plus `STAGE`: the directory being packed |
-| `smoke` | on every target, after unpacking, and again after the npm install | an empty directory | `BIN`: the installed binary; `REPO`; `ASSET`; `VERSION` |
+| `smoke` | on every target (and the wasm build), after unpacking, and again after the npm install | an empty directory | `BIN`: the installed binary, or the wasm package's command; `REPO`; `ASSET`; `VERSION` |
 
 `REPO` is the absolute path of `directory` in the checkout; `ASSET` is the
 target (`x86_64-linux`); `VERSION` is the version being built. On Linux the
-build has LLVM 18's `clang`, `lld`, `opt`, `llc` and `llvm-as` on `PATH`; on
+build has LLVM 18's `clang`, `lld`, `wasm-ld`, `opt`, `llc` and `llvm-as` on
+`PATH`, and the wasm build also has the WASI sysroot, at `WASI_SYSROOT`; on
 macOS it uses Xcode's `clang`.
 
 ## Inputs
@@ -394,6 +455,9 @@ Everything is optional except where noted.
 | `link-flags` | | Extra flags for `nish <entry> --link`, such as `--profile size`. |
 | `setup` | | Shell run before the build on every target. |
 | `build` | | Shell that writes the binary to `$OUT`. |
+| `wasm` | `false` | In app mode, also build a `wasm32-wasi` module, attached to the release and, with `npm`, published as `<name>-wasm32-wasi` ([WebAssembly](#webassembly)). |
+| `wasm-build` | | Shell that writes the `wasm32-wasi` module to `$OUT`, instead of the Nish `wasi` link. |
+| `wasm-link-flags` | | Extra flags for `nish <entry> --link <module> --profile wasi`. |
 | `targets` | all four | JSON array from `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-darwin`. |
 | `include` | `LICENSE README.md THIRD_PARTY_NOTICES.md` | Files copied beside `bin/` in every tarball; missing ones are skipped. |
 | `stage` | | Shell that adds files beside the binary in `$STAGE`. |
@@ -448,6 +512,8 @@ project that installed the package checks its provenance.
 | there is no nish-version input and no .nish-version file | Add `.nish-version` holding the nish release, such as `0.39.0`. |
 | `--version` printed "…", which does not name X | Make the program print its version, or set `check-version: false`. |
 | the build wrote no executable at `$OUT` | With `build`, write the binary to exactly `$OUT`. |
+| the wasm build wrote no module at `$OUT` / is not a WebAssembly module | With `wasm-build`, write the `wasm32-wasi` module to exactly `$OUT`. |
+| wasm builds a program as a wasm32-wasi module, so it needs mode app | Drop `wasm` from a library; a Nish library ships as source. |
 | this runner is X, but the target is built on Y | GitHub moved a runner label; pin `targets` to the ones that work and report it here. |
 | package.json declares bin / optionalDependencies | Remove them; the release writes both. |
 | has never been published, so it cannot trust this workflow yet | Add `NPM_TOKEN` to the `npm` environment for the first release ([npm](#npm)). |
@@ -474,8 +540,11 @@ The action that installs Nish works in any workflow, such as a repository's CI:
 
 It installs the release's own `install.sh` from that version's tag, puts
 `nish` on `PATH`, and on Linux installs LLVM 18 from apt with the plain tool
-names linked onto `PATH`. Inputs: `version`, `version-file` (default
-`.nish-version`). Outputs: `version`, `nish` (its absolute path).
+names linked onto `PATH`. With `wasi: true` (Linux only) it also installs the
+WASI sysroot and compiler-rt's wasm32 builtins and sets `WASI_SYSROOT`, so
+`nish --profile wasi` links. Inputs: `version`, `version-file` (default
+`.nish-version`), `wasi` (default `false`). Outputs: `version`, `nish` (its
+absolute path).
 
 ## Maintaining this repository
 

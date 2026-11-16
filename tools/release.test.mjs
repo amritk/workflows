@@ -7,6 +7,7 @@ import path from "node:path"
 import { describe, it } from "node:test"
 import {
   TARGETS,
+  WASM_ASSET,
   aur,
   formula,
   formulaClass,
@@ -18,6 +19,9 @@ import {
   releasePleaseCheck,
   rows,
   tarballName,
+  wasmName,
+  wasmPackage,
+  wasmRunner,
 } from "./release.mjs"
 
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), "release-test-"))
@@ -246,6 +250,114 @@ describe("npm", () => {
   })
 })
 
+/**
+ * The smallest WASI command that says something: a module whose `_start`
+ * calls `proc_exit(status)`, assembled by hand so the test needs no toolchain.
+ */
+const exitModule = (status) => {
+  const name = (text) => [text.length, ...Buffer.from(text)]
+  const section = (id, bytes) => [id, bytes.length, ...bytes]
+  return Buffer.from([
+    ...[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+    // (i32) -> () for proc_exit, () -> () for _start
+    ...section(1, [2, 0x60, 1, 0x7f, 0, 0x60, 0, 0]),
+    ...section(2, [1, ...name("wasi_snapshot_preview1"), ...name("proc_exit"), 0x00, 0]),
+    ...section(3, [1, 1]),
+    ...section(5, [1, 0x00, 1]),
+    ...section(7, [2, ...name("memory"), 0x02, 0, ...name("_start"), 0x00, 1]),
+    // i32.const status; call proc_exit; end
+    ...section(10, [1, 6, 0, 0x41, status, 0x10, 0, 0x0b]),
+  ])
+}
+
+describe("wasm", () => {
+  const module = (status = 7) => {
+    const file = path.join(temp(), "tool.wasm")
+    fs.writeFileSync(file, exitModule(status))
+    return file
+  }
+
+  it("names the release's module", () => {
+    assert.equal(wasmName("tool", "1.2.3"), "tool-1.2.3-wasm32-wasi.wasm")
+  })
+
+  it("makes a package with the module, its command and the staged files", () => {
+    const stage = temp()
+    fs.writeFileSync(path.join(stage, "LICENSE"), "MIT\n")
+    const manifest = wasmPackage(stage, module(), "tool", "1.2.3", "@scope/tool", { license: "MIT" })
+    assert.equal(manifest.name, "@scope/tool-wasm32-wasi")
+    assert.equal(manifest.os, undefined)
+    assert.equal(manifest.cpu, undefined)
+    assert.deepEqual(manifest.bin, { tool: "bin/tool.mjs" })
+    assert.equal(manifest.exports["./wasm"], "./bin/tool.wasm")
+    assert.deepEqual(manifest.files.sort(), ["LICENSE", "bin"])
+    assert.deepEqual(fs.readdirSync(path.join(stage, "bin")).sort(), ["tool.mjs", "tool.wasm"])
+    assert.ok(fs.statSync(path.join(stage, "bin", "tool.mjs")).mode & 0o100)
+  })
+
+  it("refuses a file that is not WebAssembly, and a bin that is not a command name", () => {
+    const text = path.join(temp(), "tool.wasm")
+    fs.writeFileSync(text, "#!/bin/sh\necho tool\n")
+    assert.throws(() => wasmPackage(temp(), text, "tool", "1.2.3", "tool"), /is not a WebAssembly module/)
+    assert.throws(() => wasmPackage(temp(), module(), "../tool", "1.2.3", "tool"), /not a command name/)
+  })
+
+  it("writes a runner node can parse", () => {
+    const file = path.join(temp(), "tool.mjs")
+    fs.writeFileSync(file, wasmRunner("tool"))
+    const check = spawnSync(process.execPath, ["--check", file], { encoding: "utf8" })
+    assert.equal(check.status, 0, check.stderr)
+  })
+
+  it("runs the module under node, passing its exit status and printing no warning", () => {
+    const stage = temp()
+    wasmPackage(stage, module(7), "tool", "1.2.3", "tool")
+    const run = spawnSync(process.execPath, [path.join(stage, "bin", "tool.mjs"), "--version"], { encoding: "utf8" })
+    assert.equal(run.status, 7, run.stderr)
+    assert.equal(run.stderr, "")
+  })
+
+  it("is what the launcher runs when no platform package is installed", () => {
+    const modules = path.join(temp(), "node_modules")
+    const wasm = path.join(modules, "tool-wasm32-wasi")
+    fs.mkdirSync(wasm, { recursive: true })
+    wasmPackage(wasm, module(5), "tool", "1.2.3", "tool")
+    fs.mkdirSync(path.join(modules, "tool", "bin"), { recursive: true })
+    const file = path.join(modules, "tool", "bin", "tool.mjs")
+    fs.writeFileSync(file, launcher("tool", "tool", { wasm: true }))
+    const run = spawnSync(process.execPath, [file], { encoding: "utf8" })
+    assert.equal(run.status, 5, run.stderr)
+
+    fs.rmSync(wasm, { recursive: true })
+    const missing = spawnSync(process.execPath, [file], { encoding: "utf8" })
+    assert.equal(missing.status, 2)
+    assert.match(missing.stderr, /install tool-wasm32-wasi, which runs tool on any platform node runs on/)
+  })
+
+  it("is named by the launcher only when the release has it", () => {
+    assert.doesNotMatch(launcher("tool", "tool"), /wasm32-wasi/)
+    assert.match(launcher("tool", "tool", { wasm: true }), /const WASM = "tool-wasm32-wasi"/)
+  })
+
+  it("turns on the main package's fallback without pinning it", () => {
+    const project = temp()
+    fs.writeFileSync(path.join(project, "package.json"), JSON.stringify({ name: "tool", version: "1.2.3" }))
+    const cwd = process.cwd()
+    process.chdir(project)
+    let tarball
+    try {
+      tarball = mainPackage(temp(), "tool", "1.2.3", ["x86_64-linux", WASM_ASSET])
+      assert.throws(() => mainPackage(temp(), "tool", "1.2.3", [WASM_ASSET]), /at least one native target/)
+    } finally {
+      process.chdir(cwd)
+    }
+    const manifest = JSON.parse(spawnSync("tar", ["-xzOf", tarball, "package/package.json"], { encoding: "utf8" }).stdout)
+    assert.deepEqual(manifest.optionalDependencies, { "tool-x86_64-linux": "1.2.3" })
+    const script = spawnSync("tar", ["-xzOf", tarball, "package/bin/tool.mjs"], { encoding: "utf8" }).stdout
+    assert.match(script, /const WASM = "tool-wasm32-wasi"/)
+  })
+})
+
 describe("releasePleaseCheck", () => {
   const config = (settings = {}, top = {}) => ({
     ...top,
@@ -330,7 +442,7 @@ const workflowJobs = () => {
 describe("release.yml", () => {
   it("reads the jobs it checks", () => {
     const jobs = workflowJobs()
-    for (const name of ["plan", "build", "release", "npm", "homebrew", "aur"]) assert.ok(jobs[name], name)
+    for (const name of ["plan", "build", "wasm", "release", "npm", "homebrew", "aur"]) assert.ok(jobs[name], name)
     assert.deepEqual(jobs.npm.needs, ["plan", "release"])
   })
 

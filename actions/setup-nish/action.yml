@@ -3,7 +3,8 @@ description: >-
   Install a pinned Nish compiler and the C toolchain it links with, and put
   `nish` on PATH. The version is the `version` input, or else the repository's
   `.nish-version` file.
-  Works on the GitHub-hosted Linux and macOS runners.
+  Works on the GitHub-hosted Linux and macOS runners. With `wasi`, also the
+  WASI sysroot that `--profile wasi` links against (Linux only).
 
 inputs:
   version:
@@ -14,6 +15,10 @@ inputs:
     description: The file holding the version when `version` is empty, relative to the workspace.
     required: false
     default: .nish-version
+  wasi:
+    description: Also install the WASI sysroot and compiler-rt's wasm32 builtins, so `nish --profile wasi` can link a `wasm32-wasi` module. Linux only.
+    required: false
+    default: "false"
 
 outputs:
   version:
@@ -60,10 +65,26 @@ runs:
         sudo apt-get install -y -qq clang-18 lld-18 llvm-18
         bin="$RUNNER_TEMP/llvm-bin"
         mkdir -p "$bin"
-        for tool in clang llc opt llvm-as ld.lld; do
+        for tool in clang llc opt llvm-as ld.lld wasm-ld; do
           ln -sf "/usr/bin/$tool-18" "$bin/$tool"
         done
         echo "$bin" >> "$GITHUB_PATH"
+
+    # Ubuntu packages the sysroot into /usr (/usr/include/wasm32-wasi,
+    # /usr/lib/wasm32-wasi), which nish's build.sh does not look in by
+    # itself, so WASI_SYSROOT names it.
+    - name: WASI sysroot (Linux)
+      if: inputs.wasi == 'true'
+      shell: bash
+      env:
+        RUNNER_OS_NAME: ${{ runner.os }}
+      run: |
+        if [ "$RUNNER_OS_NAME" != "Linux" ]; then
+          echo "::error::setup-nish installs the WASI sysroot on Linux only; link wasm on a Linux runner"
+          exit 1
+        fi
+        sudo apt-get install -y -qq wasi-libc libclang-rt-18-dev-wasm32
+        echo "WASI_SYSROOT=/usr" >> "$GITHUB_ENV"
 
     - name: Install nish ${{ steps.pin.outputs.version }}
       id: install
