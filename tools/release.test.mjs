@@ -298,3 +298,51 @@ describe("releasePleaseCheck", () => {
     assert.throws(() => releasePleaseCheck(config(), { ".": "0.1.0" }, ".", "0.2.0"), /0\.1\.0, but package.json's version is 0\.2\.0/)
   })
 })
+
+// The jobs of .github/workflows/release.yml, each with its `needs` and its
+// `if` (a folded `>-` one joined to one line), read as text: the repository
+// has no YAML parser, and these two keys are all the test needs.
+const workflowJobs = () => {
+  const file = path.join(import.meta.dirname, "../.github/workflows/release.yml")
+  const lines = fs.readFileSync(file, "utf8").split("\n")
+  const jobs = {}
+  let job = null
+  for (let i = lines.indexOf("jobs:") + 1; i < lines.length; i++) {
+    const name = /^ {2}([\w-]+):$/.exec(lines[i])
+    if (name) {
+      job = jobs[name[1]] = { needs: [], if: "" }
+      continue
+    }
+    if (!job) continue
+    const needs = /^ {4}needs: (.+)$/.exec(lines[i])
+    if (needs) job.needs = needs[1].replace(/[[\]]/g, "").split(",").map((n) => n.trim())
+    const cond = /^ {4}if: (.*)$/.exec(lines[i])
+    if (cond && cond[1] !== ">-") job.if = cond[1]
+    else if (cond) {
+      const folded = []
+      while (/^ {6}\S/.test(lines[i + 1] ?? "")) folded.push(lines[++i].trim())
+      job.if = folded.join(" ")
+    }
+  }
+  return jobs
+}
+
+describe("release.yml", () => {
+  it("reads the jobs it checks", () => {
+    const jobs = workflowJobs()
+    for (const name of ["plan", "build", "release", "npm", "homebrew", "aur"]) assert.ok(jobs[name], name)
+    assert.deepEqual(jobs.npm.needs, ["plan", "release"])
+  })
+
+  // An `if` with no status function is `success() && …`, and success() fails
+  // when any job upstream was skipped. Library mode skips build, so a job after
+  // release that leaned on success() would never run: v0.2.0 of a library
+  // reached GitHub but not npm that way.
+  it("gates every job after release on release's own result", () => {
+    const after = Object.entries(workflowJobs()).filter(([, job]) => job.needs.includes("release"))
+    assert.ok(after.length > 0)
+    for (const [name, job] of after) {
+      assert.match(job.if, /^!cancelled\(\) && needs\.release\.result == 'success' && /, name)
+    }
+  })
+})
