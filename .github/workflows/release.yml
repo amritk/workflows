@@ -601,7 +601,7 @@ jobs:
           command="$project/node_modules/$name/bin/$BIN.mjs"
           if cmp -s "$command" "$STAGE/bin/$BIN"; then
             echo "the npm-installed command is the binary itself"
-          elif [ "$(ls -A "$STAGE/bin" | wc -l)" -eq 1 ] && [ -z "$(find "$STAGE" -mindepth 1 -maxdepth 1 ! -name bin ! -type f)" ]; then
+          elif [ "$(find "$STAGE/bin" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ] && [ -z "$(find "$STAGE" -mindepth 1 -maxdepth 1 ! -name bin ! -type f)" ]; then
             echo "::error::the postinstall script left the launcher in place of $BIN"
             exit 1
           else
@@ -713,9 +713,11 @@ jobs:
           # that is not WebAssembly. With no package.json, the bin names it.
           node "$WORKFLOWS/tools/release.mjs" wasm "$stage" "$OUT" "$BIN" "$VERSION" "${NPM_NAME:-$BIN}" > /dev/null
           ls -l "$module"
-          echo "module=$module" >> "$GITHUB_OUTPUT"
-          echo "stage=$stage" >> "$GITHUB_OUTPUT"
-          echo "bin=$stage/bin/$BIN.mjs" >> "$GITHUB_OUTPUT"
+          {
+            echo "module=$module"
+            echo "stage=$stage"
+            echo "bin=$stage/bin/$BIN.mjs"
+          } >> "$GITHUB_OUTPUT"
 
       - name: The module runs under node
         env:
