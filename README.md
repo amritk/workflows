@@ -127,8 +127,8 @@ version, and a package.json if it publishes to npm.
    `<bin>-<version>-<target>.tar.gz`. It unpacks that tarball, checks
    `<bin> --version`, and runs `smoke`. With npm on, it also packs the platform
    package and the launcher package, installs both into an empty project,
-   checks the installed command is the binary itself, and runs the version
-   check and `smoke` again through it.
+   checks the installed command execs the binary directly, and runs the
+   version check and `smoke` again through it.
 4. **wasm** (app mode with `wasm`), on Linux: installs Nish with the WASI
    sysroot, runs `setup`, links the `wasm32-wasi` module (or runs
    `wasm-build`), and checks `<bin> --version` and runs `smoke` through the
@@ -311,17 +311,20 @@ binary. A lockfile still lists them all, so it works on every machine.
 
 How the command reaches the binary: npm can link a command only to a file in
 the package that declares it, and the binary is in another package. So the
-command is first a small node launcher, and the postinstall script then puts
-the platform's binary in the launcher's place (a hard link, or a copy).
-`npm install -g <name>` therefore leaves the binary itself on `PATH`, and a
-project's `node_modules/.bin/<bin>` is the binary too: about 1 ms to run, where
-the launcher adds a node start, about 30 ms, to every run.
+command is first a small node launcher, and the postinstall script then
+replaces it with a one-line `/bin/sh` script that execs the platform's binary
+where it lies, in its own package (the approach
+[nish](https://github.com/amritk/nish) takes for its own compiler). So
+`npm install -g <name>` leaves a command on `PATH` that runs the binary with no
+node in between: 1 to 2 ms a run, where the launcher adds a node start, about
+30 ms. The binary runs beside the files the release staged with it (`include`,
+`stage`), so a program that finds data by its own path keeps finding it.
 
-When install scripts do not run (`--ignore-scripts`, pnpm and bun by default,
-Yarn PnP), the launcher stays and still works, at that 30 ms. It also stays
-when the platform package holds anything beside the binary in `bin/` or
-any directory beside `bin/` (from `include` or `stage`), so the binary keeps
-finding those files where they are.
+The binary's path is fixed when the package installs. If `node_modules` is
+moved without reinstalling, the command says so and exits 2, and
+`npm rebuild <name>` points it at the binary again. When install scripts do
+not run (`--ignore-scripts`, pnpm and bun by default, Yarn PnP) or on Windows,
+the launcher stays, and works at that 30 ms.
 
 The launcher runs the platform's binary by its absolute path and passes its
 exit code through. On a machine with no published binary, or an install made
@@ -538,7 +541,8 @@ project that installed the package checks its provenance.
 | wasm builds a program as a wasm32-wasi module, so it needs mode app | Drop `wasm` from a library; a Nish library ships as source. |
 | this runner is X, but the target is built on Y | GitHub moved a runner label; pin `targets` to the ones that work and report it here. |
 | package.json declares bin / optionalDependencies / a postinstall script | Remove them; the release writes all three. |
-| the postinstall script left the launcher in place of X | Report it here, with the build job's log: the install script failed to put the binary in place. |
+| the postinstall script left the launcher in place of X | Report it here, with the build job's log: the install script failed to point the command at the binary. |
+| X is not where it was installed; run 'npm rebuild …' | `node_modules` moved after the install; run the `npm rebuild` it names, or reinstall. |
 | has never been published, so it cannot trust this workflow yet | Add `NPM_TOKEN` to the `npm` environment for the first release ([npm](#npm)). |
 | npm publish fails with 404 or `ENEEDAUTH` after the first release | The trusted publisher must name your repository, your workflow file and the environment `npm` exactly, on every package. |
 | HOMEBREW_TAP_TOKEN / AUR_SSH_KEY is not set | Put the secret in the environment the job names (`homebrew`, `aur`), not in repository secrets under another name. |

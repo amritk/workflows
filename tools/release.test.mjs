@@ -187,17 +187,18 @@ describe("npm", () => {
     assert.equal(check.status, 0, check.stderr)
   })
 
-  // node_modules as npm lays it out: the main package with its launcher and
+  // node_modules as npm lays it out, under a directory whose name a shell
+  // would expand if it were not quoted: the main package with its launcher and
   // install script, and this machine's platform package with `files` in it.
   const installed = (files) => {
     const asset = Object.keys(TARGETS).find((a) => `${TARGETS[a].os}-${TARGETS[a].cpu}` === `${process.platform}-${process.arch}`)
-    const modules = path.join(temp(), "node_modules")
+    const modules = path.join(temp(), "it's $HOME `x`", "node_modules")
     const main = path.join(modules, "tool", "bin")
     fs.mkdirSync(main, { recursive: true })
     fs.writeFileSync(path.join(main, "tool.mjs"), launcher("tool", "tool"), { mode: 0o755 })
     fs.writeFileSync(path.join(main, "tool-postinstall.mjs"), postinstall("tool", "tool"))
-    if (asset !== undefined && files !== null) {
-      const platform = path.join(modules, `tool-${asset}`)
+    const platform = asset === undefined ? null : path.join(modules, `tool-${asset}`)
+    if (platform !== null && files !== null) {
       fs.mkdirSync(path.join(platform, "bin"), { recursive: true })
       fs.writeFileSync(path.join(platform, "package.json"), JSON.stringify({ name: `tool-${asset}` }))
       for (const [name, text] of Object.entries(files)) {
@@ -206,27 +207,38 @@ describe("npm", () => {
       }
     }
     const run = spawnSync(process.execPath, [path.join(main, "tool-postinstall.mjs")], { encoding: "utf8" })
-    return { asset, run, command: fs.readFileSync(path.join(main, "tool.mjs"), "utf8"), main }
+    const command = path.join(main, "tool.mjs")
+    return { asset, run, command, platform, text: fs.readFileSync(command, "utf8") }
   }
-  const binary = "#!/bin/sh\necho native\n"
+  // Reads a file staged beside it, as a binary that finds its data by its own path does.
+  const binary = '#!/bin/sh\ncat "$(dirname "$0")/data.txt"\necho "$@"\nexit 4\n'
 
-  it("puts the platform's binary where npm linked the command", (t) => {
-    const { asset, run, command, main } = installed({ "bin/tool": binary, LICENSE: "MIT\n" })
+  it("points the command at the platform's binary, run where it lies", (t) => {
+    const { asset, run, command, platform, text } = installed({ "bin/tool": binary, "bin/data.txt": "beside\n", LICENSE: "MIT\n" })
     if (asset === undefined) return t.skip("no target for this machine")
     assert.equal(run.status, 0, run.stderr)
-    assert.equal(command, binary)
-    assert.ok(fs.statSync(path.join(main, "tool.mjs")).mode & 0o100)
-    assert.deepEqual(fs.readdirSync(main).sort(), ["tool-postinstall.mjs", "tool.mjs"])
+    assert.match(text, /^#!\/bin\/sh\n/)
+    const quoted = `'${path.join(platform, "bin", "tool").split("'").join("'\\''")}'`
+    assert.ok(text.includes(`exec ${quoted} "$@"`), text)
+    const ran = spawnSync(command, ["a b", "$HOME"], { encoding: "utf8" })
+    assert.equal(ran.stdout, "beside\na b $HOME\n", ran.stderr)
+    assert.equal(ran.status, 4)
+    assert.deepEqual(fs.readdirSync(path.dirname(command)).sort(), ["tool-postinstall.mjs", "tool.mjs"])
   })
 
-  it("keeps the launcher when the binary has files staged beside it, or none is installed", (t) => {
-    const beside = installed({ "bin/tool": binary, "bin/data.txt": "x", "share/x": "y" })
-    if (beside.asset === undefined) return t.skip("no target for this machine")
-    assert.equal(beside.run.status, 0, beside.run.stderr)
-    assert.match(beside.command, /^#!\/usr\/bin\/env node/)
-    const missing = installed(null)
-    assert.equal(missing.run.status, 0, missing.run.stderr)
-    assert.match(missing.command, /^#!\/usr\/bin\/env node/)
+  it("says to run npm rebuild when the binary has moved", (t) => {
+    const { asset, command, platform } = installed({ "bin/tool": binary })
+    if (asset === undefined) return t.skip("no target for this machine")
+    fs.rmSync(platform, { recursive: true })
+    const ran = spawnSync(command, [], { encoding: "utf8" })
+    assert.equal(ran.status, 2)
+    assert.match(ran.stderr, /is not where it was installed; run 'npm rebuild tool'/)
+  })
+
+  it("keeps the launcher when no platform package is installed", () => {
+    const { run, text } = installed(null)
+    assert.equal(run.status, 0, run.stderr)
+    assert.match(text, /^#!\/usr\/bin\/env node/)
   })
 
   it("packs the project with the launcher, the pins and no `private`", () => {

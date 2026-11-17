@@ -596,17 +596,14 @@ jobs:
           (cd "$project" && npm init -y > /dev/null && npm install --no-audit --no-fund "$RUNNER_TEMP/out/$platform" "$main")
           echo "platform=$RUNNER_TEMP/out/$platform" >> "$GITHUB_OUTPUT"
           echo "bin=$project/node_modules/.bin/$BIN" >> "$GITHUB_OUTPUT"
-          # The main package's postinstall puts the binary where npm linked
-          # the command, unless files are staged beside it.
+          # The main package's postinstall replaces the launcher with a sh
+          # script that execs this target's binary where it lies.
           command="$project/node_modules/$name/bin/$BIN.mjs"
-          if cmp -s "$command" "$STAGE/bin/$BIN"; then
-            echo "the npm-installed command is the binary itself"
-          elif [ "$(find "$STAGE/bin" -mindepth 1 -maxdepth 1 | wc -l)" -eq 1 ] && [ -z "$(find "$STAGE" -mindepth 1 -maxdepth 1 ! -name bin ! -type f)" ]; then
+          if [ "$(head -n 1 "$command")" != "#!/bin/sh" ] || ! grep -qF "$name-$ASSET/bin/$BIN'" "$command"; then
             echo "::error::the postinstall script left the launcher in place of $BIN"
             exit 1
-          else
-            echo "::notice::files are staged beside $BIN, so the npm command stays the launcher, which runs it where they are"
           fi
+          echo "the npm-installed command execs the binary directly"
           out="$("$project/node_modules/.bin/$BIN" --version)"
           echo "$out"
           if [ "$CHECK_VERSION" = "true" ]; then
