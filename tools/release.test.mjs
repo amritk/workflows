@@ -5,8 +5,10 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { describe, it } from "node:test"
+import { pathToFileURL } from "node:url"
 import {
   TARGETS,
+  WASM_ASSET,
   aur,
   formula,
   formulaClass,
@@ -15,9 +17,13 @@ import {
   mainPackage,
   parseSums,
   platformPackage,
+  postinstall,
   releasePleaseCheck,
   rows,
   tarballName,
+  wasmName,
+  wasmPackage,
+  wasmRunner,
 } from "./release.mjs"
 
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), "release-test-"))
@@ -163,7 +169,10 @@ describe("npm", () => {
     fs.mkdirSync(path.join(stage, ".data"))
     const manifest = platformPackage(stage, "aarch64-linux", "1.2.3", "@scope/tool", { license: "MIT" })
     assert.equal(manifest.name, "@scope/tool-aarch64-linux")
-    assert.deepEqual([manifest.os, manifest.cpu], [["linux"], ["arm64"]])
+    assert.deepEqual([manifest.os, manifest.cpu, manifest.libc], [["linux"], ["arm64"], ["glibc"]])
+    const mac = temp()
+    fs.mkdirSync(path.join(mac, "bin"))
+    assert.equal(platformPackage(mac, "aarch64-darwin", "1.2.3", "tool").libc, undefined)
     assert.deepEqual(manifest.files.sort(), [".data", "bin"])
     assert.equal(manifest.bin, undefined)
   })
@@ -177,6 +186,83 @@ describe("npm", () => {
     fs.writeFileSync(file, launcher("@scope/tool", "tool"))
     const check = spawnSync(process.execPath, ["--check", file], { encoding: "utf8" })
     assert.equal(check.status, 0, check.stderr)
+  })
+
+  // node_modules as npm lays it out, under a directory whose name a shell
+  // would expand if it were not quoted: the main package with its launcher and
+  // install script, and this machine's platform package with `files` in it.
+  const installed = (files) => {
+    const asset = Object.keys(TARGETS).find((a) => `${TARGETS[a].os}-${TARGETS[a].cpu}` === `${process.platform}-${process.arch}`)
+    const modules = path.join(temp(), "it's $HOME `x`", "node_modules")
+    const main = path.join(modules, "tool", "bin")
+    fs.mkdirSync(main, { recursive: true })
+    fs.writeFileSync(path.join(main, "tool.mjs"), launcher("tool", "tool"), { mode: 0o755 })
+    fs.writeFileSync(path.join(main, "tool-postinstall.mjs"), postinstall("tool", "tool"))
+    const platform = asset === undefined ? null : path.join(modules, `tool-${asset}`)
+    if (platform !== null && files !== null) {
+      fs.mkdirSync(path.join(platform, "bin"), { recursive: true })
+      fs.writeFileSync(path.join(platform, "package.json"), JSON.stringify({ name: `tool-${asset}` }))
+      for (const [name, text] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(platform, name)), { recursive: true })
+        fs.writeFileSync(path.join(platform, name), text, { mode: 0o755 })
+      }
+    }
+    const run = spawnSync(process.execPath, [path.join(main, "tool-postinstall.mjs")], { encoding: "utf8" })
+    const command = path.join(main, "tool.mjs")
+    return { asset, run, command, platform, text: fs.readFileSync(command, "utf8") }
+  }
+  // Reads a file staged beside it, as a binary that finds its data by its own path does.
+  const binary = '#!/bin/sh\ncat "$(dirname "$0")/data.txt"\necho "$@"\nexit 4\n'
+
+  it("points the command at the platform's binary, run where it lies", (t) => {
+    const { asset, run, command, platform, text } = installed({ "bin/tool": binary, "bin/data.txt": "beside\n", LICENSE: "MIT\n" })
+    if (asset === undefined) return t.skip("no target for this machine")
+    assert.equal(run.status, 0, run.stderr)
+    assert.match(text, /^#!\/bin\/sh\n/)
+    const quoted = `'${path.join(platform, "bin", "tool").split("'").join("'\\''")}'`
+    assert.ok(text.includes(`exec ${quoted} "$@"`), text)
+    const ran = spawnSync(command, ["a b", "$HOME"], { encoding: "utf8" })
+    assert.equal(ran.stdout, "beside\na b $HOME\n", ran.stderr)
+    assert.equal(ran.status, 4)
+    assert.deepEqual(fs.readdirSync(path.dirname(command)).sort(), ["tool-postinstall.mjs", "tool.mjs"])
+  })
+
+  it("says to run npm rebuild when the binary has moved", (t) => {
+    const { asset, command, platform } = installed({ "bin/tool": binary })
+    if (asset === undefined) return t.skip("no target for this machine")
+    fs.rmSync(platform, { recursive: true })
+    const ran = spawnSync(command, [], { encoding: "utf8" })
+    assert.equal(ran.status, 2)
+    assert.match(ran.stderr, /is not where it was installed; run 'npm rebuild tool'/)
+  })
+
+  // Runs a generated script as if on musl: process.report has no glibc.
+  const onMusl = (file) => {
+    const preload = path.join(temp(), "musl.mjs")
+    fs.writeFileSync(preload, "process.report.getReport = () => ({ header: {} })\n")
+    return spawnSync(process.execPath, ["--import", pathToFileURL(preload).href, file], { encoding: "utf8" })
+  }
+
+  it("leaves the launcher on musl, which says there is no binary for it", (t) => {
+    if (process.platform !== "linux") return t.skip("musl is a Linux libc")
+    const { asset, command } = installed(null)
+    if (asset === undefined) return t.skip("no target for this machine")
+    const refused = onMusl(command)
+    assert.equal(refused.status, 2)
+    assert.match(refused.stderr, /no prebuilt binary for linux\/\w+ with musl/)
+
+    // An npm that ignores `libc` installed the glibc binary anyway.
+    const forced = installed({ "bin/tool": binary })
+    fs.writeFileSync(forced.command, launcher("tool", "tool"), { mode: 0o755 })
+    const run = onMusl(path.join(path.dirname(forced.command), "tool-postinstall.mjs"))
+    assert.equal(run.status, 0, run.stderr)
+    assert.match(fs.readFileSync(forced.command, "utf8"), /^#!\/usr\/bin\/env node/)
+  })
+
+  it("keeps the launcher when no platform package is installed", () => {
+    const { run, text } = installed(null)
+    assert.equal(run.status, 0, run.stderr)
+    assert.match(text, /^#!\/usr\/bin\/env node/)
   })
 
   it("packs the project with the launcher, the pins and no `private`", () => {
@@ -198,10 +284,16 @@ describe("npm", () => {
       process.chdir(cwd)
     }
     const list = spawnSync("tar", ["-tzf", tarball], { encoding: "utf8" }).stdout.split("\n").filter(Boolean).sort()
-    assert.deepEqual(list, ["package/bin/tool.mjs", "package/package.json", "package/src/main.ts"])
+    assert.deepEqual(list, [
+      "package/bin/tool-postinstall.mjs",
+      "package/bin/tool.mjs",
+      "package/package.json",
+      "package/src/main.ts",
+    ])
     const manifest = JSON.parse(spawnSync("tar", ["-xzOf", tarball, "package/package.json"], { encoding: "utf8" }).stdout)
     assert.equal(manifest.private, undefined)
     assert.deepEqual(manifest.bin, { tool: "bin/tool.mjs" })
+    assert.equal(manifest.scripts.postinstall, "node bin/tool-postinstall.mjs")
     assert.deepEqual(manifest.optionalDependencies, {
       "@scope/tool-aarch64-darwin": "1.2.3",
       "@scope/tool-x86_64-linux": "1.2.3",
@@ -217,6 +309,11 @@ describe("npm", () => {
       assert.throws(() => mainPackage(temp(), "tool", "1.2.3", ["x86_64-linux"]), /version is 1.0.0, not 1.2.3/)
       fs.writeFileSync("package.json", JSON.stringify({ name: "tool", version: "1.2.3", bin: "x.js" }))
       assert.throws(() => mainPackage(temp(), "tool", "1.2.3", ["x86_64-linux"]), /declares bin/)
+      // A checkout's own postinstall (a git hook installer) does not ship.
+      fs.writeFileSync("package.json", JSON.stringify({ name: "tool", version: "1.2.3", scripts: { postinstall: "lefthook install", test: "t" } }))
+      const tarball = mainPackage(temp(), "tool", "1.2.3", ["x86_64-linux"])
+      const packed = JSON.parse(spawnSync("tar", ["-xzOf", tarball, "package/package.json"], { encoding: "utf8" }).stdout)
+      assert.deepEqual(packed.scripts, { postinstall: "node bin/tool-postinstall.mjs", test: "t" })
     } finally {
       process.chdir(cwd)
     }
@@ -243,6 +340,114 @@ describe("npm", () => {
     assert.equal(manifest.bin, undefined)
     const list = spawnSync("tar", ["-tzf", tarball], { encoding: "utf8" }).stdout
     assert.match(list, /^package\/src\/index.ts$/m)
+  })
+})
+
+/**
+ * The smallest WASI command that says something: a module whose `_start`
+ * calls `proc_exit(status)`, assembled by hand so the test needs no toolchain.
+ */
+const exitModule = (status) => {
+  const name = (text) => [text.length, ...Buffer.from(text)]
+  const section = (id, bytes) => [id, bytes.length, ...bytes]
+  return Buffer.from([
+    ...[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+    // (i32) -> () for proc_exit, () -> () for _start
+    ...section(1, [2, 0x60, 1, 0x7f, 0, 0x60, 0, 0]),
+    ...section(2, [1, ...name("wasi_snapshot_preview1"), ...name("proc_exit"), 0x00, 0]),
+    ...section(3, [1, 1]),
+    ...section(5, [1, 0x00, 1]),
+    ...section(7, [2, ...name("memory"), 0x02, 0, ...name("_start"), 0x00, 1]),
+    // i32.const status; call proc_exit; end
+    ...section(10, [1, 6, 0, 0x41, status, 0x10, 0, 0x0b]),
+  ])
+}
+
+describe("wasm", () => {
+  const module = (status = 7) => {
+    const file = path.join(temp(), "tool.wasm")
+    fs.writeFileSync(file, exitModule(status))
+    return file
+  }
+
+  it("names the release's module", () => {
+    assert.equal(wasmName("tool", "1.2.3"), "tool-1.2.3-wasm32-wasi.wasm")
+  })
+
+  it("makes a package with the module, its command and the staged files", () => {
+    const stage = temp()
+    fs.writeFileSync(path.join(stage, "LICENSE"), "MIT\n")
+    const manifest = wasmPackage(stage, module(), "tool", "1.2.3", "@scope/tool", { license: "MIT" })
+    assert.equal(manifest.name, "@scope/tool-wasm32-wasi")
+    assert.equal(manifest.os, undefined)
+    assert.equal(manifest.cpu, undefined)
+    assert.deepEqual(manifest.bin, { tool: "bin/tool.mjs" })
+    assert.equal(manifest.exports["./wasm"], "./bin/tool.wasm")
+    assert.deepEqual(manifest.files.sort(), ["LICENSE", "bin"])
+    assert.deepEqual(fs.readdirSync(path.join(stage, "bin")).sort(), ["tool.mjs", "tool.wasm"])
+    assert.ok(fs.statSync(path.join(stage, "bin", "tool.mjs")).mode & 0o100)
+  })
+
+  it("refuses a file that is not WebAssembly, and a bin that is not a command name", () => {
+    const text = path.join(temp(), "tool.wasm")
+    fs.writeFileSync(text, "#!/bin/sh\necho tool\n")
+    assert.throws(() => wasmPackage(temp(), text, "tool", "1.2.3", "tool"), /is not a WebAssembly module/)
+    assert.throws(() => wasmPackage(temp(), module(), "../tool", "1.2.3", "tool"), /not a command name/)
+  })
+
+  it("writes a runner node can parse", () => {
+    const file = path.join(temp(), "tool.mjs")
+    fs.writeFileSync(file, wasmRunner("tool"))
+    const check = spawnSync(process.execPath, ["--check", file], { encoding: "utf8" })
+    assert.equal(check.status, 0, check.stderr)
+  })
+
+  it("runs the module under node, passing its exit status and printing no warning", () => {
+    const stage = temp()
+    wasmPackage(stage, module(7), "tool", "1.2.3", "tool")
+    const run = spawnSync(process.execPath, [path.join(stage, "bin", "tool.mjs"), "--version"], { encoding: "utf8" })
+    assert.equal(run.status, 7, run.stderr)
+    assert.equal(run.stderr, "")
+  })
+
+  it("is what the launcher runs when no platform package is installed", () => {
+    const modules = path.join(temp(), "node_modules")
+    const wasm = path.join(modules, "tool-wasm32-wasi")
+    fs.mkdirSync(wasm, { recursive: true })
+    wasmPackage(wasm, module(5), "tool", "1.2.3", "tool")
+    fs.mkdirSync(path.join(modules, "tool", "bin"), { recursive: true })
+    const file = path.join(modules, "tool", "bin", "tool.mjs")
+    fs.writeFileSync(file, launcher("tool", "tool", { wasm: true }))
+    const run = spawnSync(process.execPath, [file], { encoding: "utf8" })
+    assert.equal(run.status, 5, run.stderr)
+
+    fs.rmSync(wasm, { recursive: true })
+    const missing = spawnSync(process.execPath, [file], { encoding: "utf8" })
+    assert.equal(missing.status, 2)
+    assert.match(missing.stderr, /tool-wasm32-wasi runs tool on any platform node runs on: install it in place of tool/)
+  })
+
+  it("is named by the launcher only when the release has it", () => {
+    assert.doesNotMatch(launcher("tool", "tool"), /wasm32-wasi/)
+    assert.match(launcher("tool", "tool", { wasm: true }), /const WASM = "tool-wasm32-wasi"/)
+  })
+
+  it("turns on the main package's fallback without pinning it", () => {
+    const project = temp()
+    fs.writeFileSync(path.join(project, "package.json"), JSON.stringify({ name: "tool", version: "1.2.3" }))
+    const cwd = process.cwd()
+    process.chdir(project)
+    let tarball
+    try {
+      tarball = mainPackage(temp(), "tool", "1.2.3", ["x86_64-linux", WASM_ASSET])
+      assert.throws(() => mainPackage(temp(), "tool", "1.2.3", [WASM_ASSET]), /at least one native target/)
+    } finally {
+      process.chdir(cwd)
+    }
+    const manifest = JSON.parse(spawnSync("tar", ["-xzOf", tarball, "package/package.json"], { encoding: "utf8" }).stdout)
+    assert.deepEqual(manifest.optionalDependencies, { "tool-x86_64-linux": "1.2.3" })
+    const script = spawnSync("tar", ["-xzOf", tarball, "package/bin/tool.mjs"], { encoding: "utf8" }).stdout
+    assert.match(script, /const WASM = "tool-wasm32-wasi"/)
   })
 })
 
@@ -330,7 +535,7 @@ const workflowJobs = () => {
 describe("release.yml", () => {
   it("reads the jobs it checks", () => {
     const jobs = workflowJobs()
-    for (const name of ["plan", "build", "release", "npm", "homebrew", "aur"]) assert.ok(jobs[name], name)
+    for (const name of ["plan", "build", "wasm", "release", "npm", "homebrew", "aur"]) assert.ok(jobs[name], name)
     assert.deepEqual(jobs.npm.needs, ["plan", "release"])
   })
 
