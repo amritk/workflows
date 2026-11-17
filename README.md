@@ -298,9 +298,11 @@ added, and with one `<name>-<target>` package per target holding the binary
 (the way esbuild ships). The checked-in package.json does not change: the
 release adds the launcher, a postinstall script and the platform pins when it
 packs, and drops `private`, which keeps an accidental `npm publish` from a
-checkout out of the registry. Do not declare `bin`, `optionalDependencies` or
-a `postinstall` script yourself; the release writes them and refuses a
-package.json that has them.
+checkout out of the registry. Do not declare `bin` or `optionalDependencies`
+yourself; the release writes both and refuses a package.json that has them. A
+`postinstall` of your own (a git hook installer such as husky or lefthook)
+keeps running in your checkout, and the published package carries the
+release's instead, so it never runs on your users' machines.
 
 How npm picks the binary: the main package lists every platform package in
 `optionalDependencies`, and each platform package names the machine it is for
@@ -323,8 +325,9 @@ node in between: 1 to 2 ms a run, where the launcher adds a node start, about
 The binary's path is fixed when the package installs. If `node_modules` is
 moved without reinstalling, the command says so and exits 2, and
 `npm rebuild <name>` points it at the binary again. When install scripts do
-not run (`--ignore-scripts`, pnpm and bun by default, Yarn PnP) or on Windows,
-the launcher stays, and works at that 30 ms.
+not run (`--ignore-scripts`, pnpm 10 and bun by default, Yarn PnP), on Windows,
+or on musl, the launcher stays, and works at that 30 ms. pnpm 9 runs it, and
+its command runs the binary through the same script.
 
 The launcher runs the platform's binary by its absolute path and passes its
 exit code through. On a machine with no published binary, or an install made
@@ -540,7 +543,7 @@ project that installed the package checks its provenance.
 | the wasm build wrote no module at `$OUT` / is not a WebAssembly module | With `wasm-build`, write the `wasm32-wasi` module to exactly `$OUT`. |
 | wasm builds a program as a wasm32-wasi module, so it needs mode app | Drop `wasm` from a library; a Nish library ships as source. |
 | this runner is X, but the target is built on Y | GitHub moved a runner label; pin `targets` to the ones that work and report it here. |
-| package.json declares bin / optionalDependencies / a postinstall script | Remove them; the release writes all three. |
+| package.json declares bin / optionalDependencies | Remove them; the release writes both. |
 | the postinstall script left the launcher in place of X | Report it here, with the build job's log: the install script failed to point the command at the binary. |
 | X is not where it was installed; run 'npm rebuild …' | `node_modules` moved after the install; run the `npm rebuild` it names, or reinstall. |
 | has never been published, so it cannot trust this workflow yet | Add `NPM_TOKEN` to the `npm` environment for the first release ([npm](#npm)). |

@@ -5,6 +5,7 @@ import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
 import { describe, it } from "node:test"
+import { pathToFileURL } from "node:url"
 import {
   TARGETS,
   WASM_ASSET,
@@ -235,6 +236,29 @@ describe("npm", () => {
     assert.match(ran.stderr, /is not where it was installed; run 'npm rebuild tool'/)
   })
 
+  // Runs a generated script as if on musl: process.report has no glibc.
+  const onMusl = (file) => {
+    const preload = path.join(temp(), "musl.mjs")
+    fs.writeFileSync(preload, "process.report.getReport = () => ({ header: {} })\n")
+    return spawnSync(process.execPath, ["--import", pathToFileURL(preload).href, file], { encoding: "utf8" })
+  }
+
+  it("leaves the launcher on musl, which says there is no binary for it", (t) => {
+    if (process.platform !== "linux") return t.skip("musl is a Linux libc")
+    const { asset, command } = installed(null)
+    if (asset === undefined) return t.skip("no target for this machine")
+    const refused = onMusl(command)
+    assert.equal(refused.status, 2)
+    assert.match(refused.stderr, /no prebuilt binary for linux\/\w+ with musl/)
+
+    // An npm that ignores `libc` installed the glibc binary anyway.
+    const forced = installed({ "bin/tool": binary })
+    fs.writeFileSync(forced.command, launcher("tool", "tool"), { mode: 0o755 })
+    const run = onMusl(path.join(path.dirname(forced.command), "tool-postinstall.mjs"))
+    assert.equal(run.status, 0, run.stderr)
+    assert.match(fs.readFileSync(forced.command, "utf8"), /^#!\/usr\/bin\/env node/)
+  })
+
   it("keeps the launcher when no platform package is installed", () => {
     const { run, text } = installed(null)
     assert.equal(run.status, 0, run.stderr)
@@ -285,8 +309,11 @@ describe("npm", () => {
       assert.throws(() => mainPackage(temp(), "tool", "1.2.3", ["x86_64-linux"]), /version is 1.0.0, not 1.2.3/)
       fs.writeFileSync("package.json", JSON.stringify({ name: "tool", version: "1.2.3", bin: "x.js" }))
       assert.throws(() => mainPackage(temp(), "tool", "1.2.3", ["x86_64-linux"]), /declares bin/)
-      fs.writeFileSync("package.json", JSON.stringify({ name: "tool", version: "1.2.3", scripts: { postinstall: "x" } }))
-      assert.throws(() => mainPackage(temp(), "tool", "1.2.3", ["x86_64-linux"]), /declares a postinstall script/)
+      // A checkout's own postinstall (a git hook installer) does not ship.
+      fs.writeFileSync("package.json", JSON.stringify({ name: "tool", version: "1.2.3", scripts: { postinstall: "lefthook install", test: "t" } }))
+      const tarball = mainPackage(temp(), "tool", "1.2.3", ["x86_64-linux"])
+      const packed = JSON.parse(spawnSync("tar", ["-xzOf", tarball, "package/package.json"], { encoding: "utf8" }).stdout)
+      assert.deepEqual(packed.scripts, { postinstall: "node bin/tool-postinstall.mjs", test: "t" })
     } finally {
       process.chdir(cwd)
     }
@@ -397,7 +424,7 @@ describe("wasm", () => {
     fs.rmSync(wasm, { recursive: true })
     const missing = spawnSync(process.execPath, [file], { encoding: "utf8" })
     assert.equal(missing.status, 2)
-    assert.match(missing.stderr, /install tool-wasm32-wasi, which runs tool on any platform node runs on/)
+    assert.match(missing.stderr, /tool-wasm32-wasi runs tool on any platform node runs on: install it in place of tool/)
   })
 
   it("is named by the launcher only when the release has it", () => {
