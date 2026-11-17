@@ -16,6 +16,7 @@ import {
   mainPackage,
   parseSums,
   platformPackage,
+  postinstall,
   releasePleaseCheck,
   rows,
   tarballName,
@@ -167,7 +168,10 @@ describe("npm", () => {
     fs.mkdirSync(path.join(stage, ".data"))
     const manifest = platformPackage(stage, "aarch64-linux", "1.2.3", "@scope/tool", { license: "MIT" })
     assert.equal(manifest.name, "@scope/tool-aarch64-linux")
-    assert.deepEqual([manifest.os, manifest.cpu], [["linux"], ["arm64"]])
+    assert.deepEqual([manifest.os, manifest.cpu, manifest.libc], [["linux"], ["arm64"], ["glibc"]])
+    const mac = temp()
+    fs.mkdirSync(path.join(mac, "bin"))
+    assert.equal(platformPackage(mac, "aarch64-darwin", "1.2.3", "tool").libc, undefined)
     assert.deepEqual(manifest.files.sort(), [".data", "bin"])
     assert.equal(manifest.bin, undefined)
   })
@@ -181,6 +185,48 @@ describe("npm", () => {
     fs.writeFileSync(file, launcher("@scope/tool", "tool"))
     const check = spawnSync(process.execPath, ["--check", file], { encoding: "utf8" })
     assert.equal(check.status, 0, check.stderr)
+  })
+
+  // node_modules as npm lays it out: the main package with its launcher and
+  // install script, and this machine's platform package with `files` in it.
+  const installed = (files) => {
+    const asset = Object.keys(TARGETS).find((a) => `${TARGETS[a].os}-${TARGETS[a].cpu}` === `${process.platform}-${process.arch}`)
+    const modules = path.join(temp(), "node_modules")
+    const main = path.join(modules, "tool", "bin")
+    fs.mkdirSync(main, { recursive: true })
+    fs.writeFileSync(path.join(main, "tool.mjs"), launcher("tool", "tool"), { mode: 0o755 })
+    fs.writeFileSync(path.join(main, "tool-postinstall.mjs"), postinstall("tool", "tool"))
+    if (asset !== undefined && files !== null) {
+      const platform = path.join(modules, `tool-${asset}`)
+      fs.mkdirSync(path.join(platform, "bin"), { recursive: true })
+      fs.writeFileSync(path.join(platform, "package.json"), JSON.stringify({ name: `tool-${asset}` }))
+      for (const [name, text] of Object.entries(files)) {
+        fs.mkdirSync(path.dirname(path.join(platform, name)), { recursive: true })
+        fs.writeFileSync(path.join(platform, name), text, { mode: 0o755 })
+      }
+    }
+    const run = spawnSync(process.execPath, [path.join(main, "tool-postinstall.mjs")], { encoding: "utf8" })
+    return { asset, run, command: fs.readFileSync(path.join(main, "tool.mjs"), "utf8"), main }
+  }
+  const binary = "#!/bin/sh\necho native\n"
+
+  it("puts the platform's binary where npm linked the command", (t) => {
+    const { asset, run, command, main } = installed({ "bin/tool": binary, LICENSE: "MIT\n" })
+    if (asset === undefined) return t.skip("no target for this machine")
+    assert.equal(run.status, 0, run.stderr)
+    assert.equal(command, binary)
+    assert.ok(fs.statSync(path.join(main, "tool.mjs")).mode & 0o100)
+    assert.deepEqual(fs.readdirSync(main).sort(), ["tool-postinstall.mjs", "tool.mjs"])
+  })
+
+  it("keeps the launcher when the binary has files staged beside it, or none is installed", (t) => {
+    const beside = installed({ "bin/tool": binary, "bin/data.txt": "x", "share/x": "y" })
+    if (beside.asset === undefined) return t.skip("no target for this machine")
+    assert.equal(beside.run.status, 0, beside.run.stderr)
+    assert.match(beside.command, /^#!\/usr\/bin\/env node/)
+    const missing = installed(null)
+    assert.equal(missing.run.status, 0, missing.run.stderr)
+    assert.match(missing.command, /^#!\/usr\/bin\/env node/)
   })
 
   it("packs the project with the launcher, the pins and no `private`", () => {
@@ -202,10 +248,16 @@ describe("npm", () => {
       process.chdir(cwd)
     }
     const list = spawnSync("tar", ["-tzf", tarball], { encoding: "utf8" }).stdout.split("\n").filter(Boolean).sort()
-    assert.deepEqual(list, ["package/bin/tool.mjs", "package/package.json", "package/src/main.ts"])
+    assert.deepEqual(list, [
+      "package/bin/tool-postinstall.mjs",
+      "package/bin/tool.mjs",
+      "package/package.json",
+      "package/src/main.ts",
+    ])
     const manifest = JSON.parse(spawnSync("tar", ["-xzOf", tarball, "package/package.json"], { encoding: "utf8" }).stdout)
     assert.equal(manifest.private, undefined)
     assert.deepEqual(manifest.bin, { tool: "bin/tool.mjs" })
+    assert.equal(manifest.scripts.postinstall, "node bin/tool-postinstall.mjs")
     assert.deepEqual(manifest.optionalDependencies, {
       "@scope/tool-aarch64-darwin": "1.2.3",
       "@scope/tool-x86_64-linux": "1.2.3",
@@ -221,6 +273,8 @@ describe("npm", () => {
       assert.throws(() => mainPackage(temp(), "tool", "1.2.3", ["x86_64-linux"]), /version is 1.0.0, not 1.2.3/)
       fs.writeFileSync("package.json", JSON.stringify({ name: "tool", version: "1.2.3", bin: "x.js" }))
       assert.throws(() => mainPackage(temp(), "tool", "1.2.3", ["x86_64-linux"]), /declares bin/)
+      fs.writeFileSync("package.json", JSON.stringify({ name: "tool", version: "1.2.3", scripts: { postinstall: "x" } }))
+      assert.throws(() => mainPackage(temp(), "tool", "1.2.3", ["x86_64-linux"]), /declares a postinstall script/)
     } finally {
       process.chdir(cwd)
     }
