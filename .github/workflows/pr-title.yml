@@ -1,0 +1,24 @@
+# This repository's own pull request titles, checked by its own action:
+# release-please cuts versions from the squash-merge subjects, which are the
+# titles. Callers use the action pinned by commit, as README.md shows.
+name: PR title
+
+on:
+  pull_request:
+    # `edited` clears the red check when the title is fixed.
+    types: [opened, edited, reopened, synchronize]
+  merge_group:
+
+permissions: {}
+
+jobs:
+  check:
+    name: conventional title
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./actions/pr-title
