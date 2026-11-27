@@ -643,6 +643,15 @@ if (write) {
   // Splice the rendered section into CHANGELOG.md under `## [Unreleased]`,
   // which is where the file's own header says a release section goes.
   const changelogPath = path.join(root, 'CHANGELOG.md')
+  // A repository adopting the release train may have no CHANGELOG.md yet:
+  // start one with the header that says where its sections come from.
+  if (!fs.existsSync(changelogPath)) {
+    const { name } = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
+    fs.writeFileSync(
+      changelogPath,
+      `# ${name ?? 'Changelog'}\n\nEach release's section is generated from the conventional-commit subjects it\ncontains, and written here by the Release PR under \`[Unreleased]\`. The\nstructured record, the one the GitHub release reads, is\n\`changelog/<version>.json\`. Fix a wording in that file on the Release PR; do\nnot edit a generated section here by hand.\n\n## [Unreleased]\n`,
+    )
+  }
   const current = fs.readFileSync(changelogPath, 'utf8')
   const marker = '## [Unreleased]'
   if (!current.includes(marker)) {

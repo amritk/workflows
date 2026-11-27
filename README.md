@@ -40,6 +40,8 @@ Contents: [Use it](#use-it) ·
 [Troubleshooting](#troubleshooting) ·
 [setup-nish on its own](#setup-nish-on-its-own) ·
 [Conventional PR titles](#conventional-pr-titles) ·
+[Release train](#release-train) ·
+[PR description delta](#pr-description-delta) ·
 [Maintaining this repository](#maintaining-this-repository)
 
 ## Use it
@@ -618,6 +620,70 @@ that writes those notes.
 passes, since the queue merges what was checked on the pull request. The title
 reaches the script through the environment, never spliced into a shell, since
 anyone opening a pull request writes it.
+
+## Release train
+
+`release-train.yml` versions a package from its conventional commits without
+release-please: it is nish's release train, shared. On every push to the
+default branch it keeps one `chore(release): <version>` pull request open on
+`release/next`, holding the version bump, `changelog/<version>.json` (the
+structured record) and the `CHANGELOG.md` section, all written by
+[`tools/changelog-gen.mjs`](tools/changelog-gen.mjs) from the subjects since
+the last `v*` tag. Merging that pull request is the release: the next run tags
+`v<version>` and dispatches your release workflow at the tag. **A human merges
+it**; the pull request says so in its first line.
+
+```yaml
+# .github/workflows/release-pr.yml
+name: Release PR
+on:
+  push: { branches: [main] }
+  workflow_dispatch:
+permissions: {}
+jobs:
+  train:
+    uses: amritk/workflows/.github/workflows/release-train.yml@<commit-sha>
+    permissions: { contents: write, pull-requests: write, actions: write, id-token: write }
+    with:
+      bootstrap-from-npm: true # tag the published version if there is no v* tag yet
+```
+
+Inputs: `bump` (a command run with `VERSION` set that writes the version
+everywhere it is held; default: package.json and package-lock.json),
+`bootstrap-from-npm` (default `false`), `release-workflow` (default
+`release.yml`), `dispatch` (the workflows started at `release/next` so the
+Release PR gets checks; default `ci.yml pr-title.yml`), `node-version`.
+`id-token: write` is how the job learns which commit of this repository to run
+the generator from. Settings, Actions, General, Workflow permissions must allow
+GitHub Actions to create pull requests.
+
+Your release workflow, started at the tag, renders the GitHub release notes
+from the record the Release PR was reviewed with:
+
+```yaml
+- id: notes
+  uses: amritk/workflows/actions/release-notes@<commit-sha>
+  with: { version: 1.2.3 } # package.json's version
+- run: gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file "${{ steps.notes.outputs.file }}"
+```
+
+## PR description delta
+
+`actions/pr-delta` keeps a generated markdown block (a benchmark or
+bundle-size delta table) in the pull request description: it writes the file to
+the job summary and splices it between `<!-- <marker>:start -->` and
+`<!-- <marker>:end -->`, replacing the previous run's block and repairing
+dangling markers. A pull request from a fork gets the summary only.
+
+```yaml
+- uses: amritk/workflows/actions/pr-delta@<commit-sha>
+  with:
+    file: bench-delta.md
+    marker: my-bench-delta
+```
+
+The job needs `pull-requests: write`. Measuring is yours: the file is whatever
+your compare script writes.
 
 ## Maintaining this repository
 

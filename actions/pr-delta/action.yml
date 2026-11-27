@@ -14,7 +14,7 @@ inputs:
     description: The marker name, such as `niv-bench-delta`. Lower-case letters, digits and dashes.
     required: true
   github-token:
-    description: A token that may edit the pull request. Needs `pull-requests: write`.
+    description: "A token that may edit the pull request. Needs `pull-requests: write`."
     required: false
     default: ${{ github.token }}
 

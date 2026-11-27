@@ -230,6 +230,20 @@ try {
     check('a kept-out feat does not move the version', next.stdout === '0.9.1\n', next.stdout + next.stderr)
   }
   {
+    // A repository adopting the release train may have no CHANGELOG.md yet;
+    // --write starts one rather than failing the Release PR.
+    const dir = repo('0.1.0', [feat])
+    dirs.push(dir)
+    const w = run(dir, ['--version', '0.2.0', '--write'])
+    const file = path.join(dir, 'CHANGELOG.md')
+    const written = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : ''
+    check(
+      '--write starts a CHANGELOG.md when there is none',
+      w.status === 0 && written.startsWith('# fixture\n') && /## \[Unreleased\]\n\n## \[0\.2\.0\]/.test(written),
+      `exit ${w.status}\n${w.stderr}${written}`,
+    )
+  }
+  {
     // A version someone asked for is an explicit request, not a bump the notes
     // must explain, so it holds on a kept-out commit too.
     const dir = repo('0.9.0', [fix, `${releaseAs('0.12.0', hiddenA)}\nChangelog: skip`])
