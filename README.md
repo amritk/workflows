@@ -601,9 +601,12 @@ jobs:
       - uses: amritk/workflows/actions/pr-title@<commit-sha> # v1.x.y
 ```
 
-The rule is nish's (`scripts/changelog-gen.mjs --check-subject` in
-[amritk/nish](https://github.com/amritk/nish)), ported exactly in
-[`tools/pr-title.mjs`](tools/pr-title.mjs):
+The rule is the release-notes generator's own
+([`tools/changelog-gen.mjs`](tools/changelog-gen.mjs), which came from
+[amritk/nish](https://github.com/amritk/nish)): the action runs its
+`--check-subject`, so a title it accepts is one the release notes can file.
+For a repository on [the release train](#release-train) it is the very script
+that writes those notes.
 
 - `type(scope)!: subject` — the scope and the `!` (a breaking change) are
   optional;
@@ -614,14 +617,14 @@ The rule is nish's (`scripts/changelog-gen.mjs --check-subject` in
 `edited` is what clears the check once a title is fixed. A merge-queue run
 passes, since the queue merges what was checked on the pull request. The title
 reaches the script through the environment, never spliced into a shell, since
-anyone opening a pull request writes it. A change to the rule belongs in nish's
-generator first and here second, so the two never accept different titles.
+anyone opening a pull request writes it.
 
 ## Maintaining this repository
 
 - `tools/release.mjs` holds the packaging: the target table, the npm packages
-  and launcher, the Homebrew formula and the AUR files; `tools/pr-title.mjs`
-  holds the PR-title rule. `node --test 'tools/*.test.mjs'` runs their tests.
+  and launcher, the Homebrew formula and the AUR files; `tools/changelog-gen.mjs`
+  is the release-notes generator, whose `--check-subject` is the PR-title
+  rule; `tools/pr-delta.cjs` splices a block into a PR description. `node --test 'tools/*.test.mjs'` runs their tests.
 - CI runs those tests, actionlint over the workflows, and the release workflow
   itself as a dry run on [`test/hello`](test/hello): once as an app on every
   target with every channel on, once as a library, and once as a library with
