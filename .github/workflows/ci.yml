@@ -82,3 +82,19 @@ jobs:
       versioning: release-please
       release-please-config: test/hello/release-please-config.json
       release-please-manifest: test/hello/.release-please-manifest.json
+
+  # The one check to require: green only when every job above succeeded.
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs: [tools, actionlint, app-dry-run, library-dry-run, release-please-dry-run]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./actions/ci-gate
+        with:
+          needs: ${{ toJSON(needs) }}

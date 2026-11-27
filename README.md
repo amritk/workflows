@@ -42,6 +42,7 @@ Contents: [Use it](#use-it) ·
 [Conventional PR titles](#conventional-pr-titles) ·
 [Release train](#release-train) ·
 [PR description delta](#pr-description-delta) ·
+[CI gate](#ci-gate) ·
 [Maintaining this repository](#maintaining-this-repository)
 
 ## Use it
@@ -684,6 +685,32 @@ dangling markers. A pull request from a fork gets the summary only.
 
 The job needs `pull-requests: write`. Measuring is yours: the file is whatever
 your compare script writes.
+
+## CI gate
+
+`actions/ci-gate` makes one job the check a repository requires: it fails
+unless every job it needs succeeded, so the required-checks list never goes
+stale when a job is added, renamed or turned into a matrix. A skipped job
+fails it unless named in `allow-skipped`. On a `workflow_dispatch` run, which
+is how the release train starts CI on its Release PR, it also posts the
+verdict as a `ci-gate` commit status, because a required check counts no check
+run from a dispatch.
+
+```yaml
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs: [lint, test, build] # every other job
+    runs-on: ubuntu-latest
+    permissions: { statuses: write }
+    steps:
+      - uses: amritk/workflows/actions/ci-gate@<commit-sha>
+        with:
+          needs: ${{ toJSON(needs) }}
+          # allow-skipped: '["docs"]'
+```
+
+Then require `ci-gate` in the branch's ruleset (Settings, Rules).
 
 ## Maintaining this repository
 
