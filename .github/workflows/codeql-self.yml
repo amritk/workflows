@@ -1,0 +1,24 @@
+# This repository's own code scanning, through its own reusable workflow: the
+# workflow files are what callers run with their tokens, and tools/ is what
+# those workflows execute.
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  codeql:
+    uses: ./.github/workflows/codeql.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    with:
+      languages: '["actions", "javascript-typescript"]'

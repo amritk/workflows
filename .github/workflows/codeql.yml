@@ -1,0 +1,61 @@
+# CodeQL code scanning, one job per language, for a caller to run on pushes to
+# its default branch, on pull requests and on a schedule. Alerts land on the
+# caller's Security > Code scanning page and, on a pull request, as annotations
+# on its diff.
+#
+# Interpreted languages only (`build-mode: none`): `actions` (the workflow files
+# themselves, for script injection and over-broad tokens),
+# `javascript-typescript` and `python`. A compiled language needs a build and
+# its own workflow, as nish's C runtime has.
+#
+# This is "advanced setup": if a repository has CodeQL's "default setup" turned
+# on in Settings, GitHub refuses the uploads from here, so turn that off.
+
+name: codeql
+
+on:
+  workflow_call:
+    inputs:
+      languages:
+        description: A JSON array of CodeQL languages, such as ["actions", "javascript-typescript"].
+        type: string
+        required: true
+      queries:
+        description: The query suite. security-and-quality is what nish runs; security-extended is the narrower one.
+        type: string
+        default: security-and-quality
+      config:
+        description: Optional inline CodeQL config (YAML), such as `paths-ignore` for generated or vendored code.
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  analyze:
+    name: codeql (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+      # Reading the run's own workflow details; only needed on private repositories.
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(inputs.languages) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: ${{ inputs.queries }}
+          config: ${{ inputs.config }}
+
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:${{ matrix.language }}

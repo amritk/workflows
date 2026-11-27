@@ -40,6 +40,7 @@ Contents: [Use it](#use-it) ·
 [Troubleshooting](#troubleshooting) ·
 [setup-nish on its own](#setup-nish-on-its-own) ·
 [Conventional PR titles](#conventional-pr-titles) ·
+[Code scanning](#code-scanning) ·
 [Maintaining this repository](#maintaining-this-repository)
 
 ## Use it
@@ -616,6 +617,36 @@ passes, since the queue merges what was checked on the pull request. The title
 reaches the script through the environment, never spliced into a shell, since
 anyone opening a pull request writes it. A change to the rule belongs in nish's
 generator first and here second, so the two never accept different titles.
+
+## Code scanning
+
+`codeql.yml` runs CodeQL, one job per language, uploading to the repository's
+Security > Code scanning page. It covers interpreted languages (`build-mode:
+none`): `actions`, which scans the workflow files themselves for script
+injection and over-broad tokens, `javascript-typescript` and `python`. A
+compiled language needs its own workflow with a build.
+
+```yaml
+# .github/workflows/codeql.yml
+name: CodeQL
+on:
+  push: { branches: [main] }
+  pull_request:
+  schedule: [{ cron: "23 5 * * 2" }]
+  workflow_dispatch:
+permissions: {}
+jobs:
+  codeql:
+    uses: amritk/workflows/.github/workflows/codeql.yml@<commit-sha>
+    permissions: { contents: read, security-events: write, actions: read }
+    with:
+      languages: '["actions", "javascript-typescript"]'
+```
+
+Inputs: `languages` (a JSON array), `queries` (default `security-and-quality`),
+`config` (inline CodeQL config, such as `paths-ignore`). This is advanced
+setup: turn CodeQL's default setup off in Settings, Code security, or GitHub
+refuses the uploads.
 
 ## Maintaining this repository
 
