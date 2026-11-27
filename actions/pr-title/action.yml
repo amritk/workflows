@@ -1,10 +1,12 @@
 name: Conventional PR title
 description: >-
-  Fail unless the pull request's title is a conventional commit subject, by the
-  rule nish's release-notes generator applies: `type(scope)!: subject`, a type
-  with a release-notes section (feat, fix, perf, refactor, docs, test, build,
-  ci, chore), and no full stop at the end. A merge-queue run has no title and
-  passes, since the queue merges what was checked on the pull request.
+  Fail unless the pull request's title is a conventional commit subject, as the
+  release-notes generator (tools/changelog-gen.mjs) reads one:
+  `type(scope)!: subject`, a type with a release-notes section (feat, fix,
+  perf, refactor, docs, test, build, ci, chore), and no full stop at the end.
+  It runs the generator's own --check-subject, so a title it accepts is one the
+  release notes can file. A merge-queue run has no title and passes, since the
+  queue merges what was checked on the pull request.
 
 inputs:
   title:
@@ -26,4 +28,7 @@ runs:
           echo "merge queue: the title was checked on the pull request"
           exit 0
         fi
-        node "$GITHUB_ACTION_PATH/../../tools/pr-title.mjs"
+        if ! node "$GITHUB_ACTION_PATH/../../tools/changelog-gen.mjs" --check-subject "$TITLE"; then
+          echo "::error title=PR title::not a conventional commit subject that the release notes can file; see the log"
+          exit 1
+        fi

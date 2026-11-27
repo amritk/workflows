@@ -1,0 +1,68 @@
+name: CI gate
+description: >-
+  Fail unless every job the calling job needs succeeded, so a repository can
+  require one `ci-gate` check instead of a list of jobs that goes stale. Use it
+  in a job with `if: always()` and `needs:` every other job, passing
+  `toJSON(needs)`. A skipped job fails the gate unless it is listed in
+  `allow-skipped`. On a `workflow_dispatch` run (how the release train starts
+  CI on its Release PR) it also posts the verdict as a `ci-gate` commit status,
+  since a required check counts no check run from a dispatch.
+
+inputs:
+  needs:
+    description: "The calling job's `needs` context, passed through toJSON(needs)."
+    required: true
+  allow-skipped:
+    description: A JSON array of job names that may be skipped, such as ["docs"].
+    required: false
+    default: "[]"
+  github-token:
+    description: "A token with `statuses: write`, used on a dispatched run only."
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Every needed job succeeded
+      id: gate
+      shell: bash
+      env:
+        NEEDS: ${{ inputs.needs }}
+        ALLOW_SKIPPED: ${{ inputs.allow-skipped }}
+      run: |
+        # Pass only on the verdict's own success line, not on a zero exit
+        # status alone: a script that ran nothing must not read as green.
+        if out="$(node "$GITHUB_ACTION_PATH/../../tools/ci-gate.mjs")" && [ "$out" = "every needed job succeeded" ]; then
+          echo "$out"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+        else
+          printf '%s\n' "$out"
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Report the gate as a commit status
+      if: github.event_name == 'workflow_dispatch'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        OK: ${{ steps.gate.outputs.ok }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        if [ "$OK" = "true" ]; then
+          state=success
+          description="Every needed job succeeded"
+        else
+          state=failure
+          description="A needed job failed, was cancelled or was skipped"
+        fi
+        gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+          -f state="$state" -f context=ci-gate \
+          -f description="$description" -f target_url="$RUN_URL" > /dev/null
+
+    - name: Fail the gate
+      if: steps.gate.outputs.ok != 'true'
+      shell: bash
+      run: |
+        echo "::error title=ci-gate::a needed job did not succeed; see the annotations above"
+        exit 1

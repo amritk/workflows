@@ -1,0 +1,291 @@
+# The release train: conventional commits in, one Release PR out, a tag when it
+# merges. It is nish's release-pr.yml, shared, with tools/changelog-gen.mjs as
+# the release-notes generator.
+#
+# On every push to the default branch it runs one of two paths:
+#
+# - pr: the generator walks the conventional commits since the last `v*` tag,
+#   works out the next version, writes `changelog/<version>.json` and the
+#   CHANGELOG.md section, the caller's `bump` command writes the version, and
+#   all of it is force-pushed to `release/next` and opened (or refreshed) as
+#   the `chore(release): <version>` pull request. A human merges it: merging it
+#   publishes.
+# - tag: that merge put `changelog/<version>.json` for the package.json version
+#   on the default branch with no tag yet, so this tags `v<version>` and
+#   dispatches the caller's release workflow at the tag. Why a dispatch: a tag
+#   pushed with GITHUB_TOKEN starts no workflow run, a dispatch does.
+#
+# The caller grants `id-token: write` so the job can learn which commit of this
+# repository it was loaded from (from its OIDC token) and run the generator
+# that shipped with the workflow file it pinned. README.md, "Release train",
+# has the setup.
+
+name: release-train
+
+on:
+  workflow_call:
+    inputs:
+      bump:
+        description: >-
+          A shell command, run at the repository root with `VERSION` set, that
+          writes the next version into every file that holds it. Empty sets
+          package.json's `version` (and package-lock.json's, when there is one).
+        type: string
+        default: ""
+      bootstrap-from-npm:
+        description: >-
+          With no `v*` tag yet, tag the commit npm records as the gitHead of the
+          package.json version, so a package that already shipped is not read
+          as a first release. Without it, a repository with no tag must tag its
+          last release by hand.
+        type: boolean
+        default: false
+      release-workflow:
+        description: The caller's workflow file the tag is dispatched to.
+        type: string
+        default: release.yml
+      dispatch:
+        description: >-
+          Workflow files started at `release/next` after each push, so the
+          Release PR gets its checks: runs raised by a GITHUB_TOKEN push wait
+          for approval, a dispatch does not. Space-separated.
+        type: string
+        default: ci.yml pr-title.yml
+      node-version:
+        description: The Node release the generator runs on.
+        type: string
+        default: 26.13.1
+
+permissions: {}
+
+concurrency:
+  group: release-train-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  train:
+    name: release train
+    # Only the default branch of the repository itself releases: a dispatch
+    # from a feature branch would otherwise tag that branch, or rebuild
+    # `release/next` from it, and a fork has nothing to publish.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && !github.event.repository.fork
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: repo
+          fetch-depth: 0 # the generator walks the log back to the last tag
+
+      # A reusable workflow cannot see which commit of its own repository it
+      # was loaded from; the job's OIDC token can.
+      - name: Which commit of this workflow is running
+        id: self
+        run: |
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::error::the release train needs \`id-token: write\` from its caller, to learn which commit of itself to run"
+            exit 1
+          fi
+          token="$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=amritk-workflows" | jq -r .value)"
+          claims="$(printf '%s' "$token" | cut -d. -f2 | tr '_-' '/+')"
+          while [ $(( ${#claims} % 4 )) -ne 0 ]; do claims="$claims="; done
+          claims="$(printf '%s' "$claims" | base64 -d)"
+          ref="$(printf '%s' "$claims" | jq -r .job_workflow_ref)"
+          sha="$(printf '%s' "$claims" | jq -r .job_workflow_sha)"
+          echo "running $ref ($sha)"
+          echo "repository=$(printf '%s' "$ref" | cut -d/ -f1-2)" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ steps.self.outputs.repository }}
+          ref: ${{ steps.self.outputs.sha }}
+          path: _workflows
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Tag the last published release if no tag exists yet
+        if: inputs.bootstrap-from-npm
+        working-directory: repo
+        run: |
+          if git describe --tags --abbrev=0 --match 'v*' >/dev/null 2>&1; then
+            exit 0
+          fi
+          version="$(node -p "require('./package.json').version")"
+          name="$(node -p "require('./package.json').name")"
+          head="$(npm view "$name@$version" gitHead 2>/dev/null || true)"
+          if [ -z "$head" ] || ! git cat-file -e "$head^{commit}" 2>/dev/null; then
+            echo "::error::no v* tag, and npm records no gitHead in this history for $name@$version. Tag the commit $version was published from: git tag -a v$version <sha> -m \"$name $version\" && git push origin v$version"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$version" "$head" -m "$name $version"
+          git push origin "v$version"
+          echo "::notice::tagged v$version at $head, the gitHead npm records for $name@$version"
+
+      - name: Decide which path this push is on
+        id: path
+        working-directory: repo
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "name=$(node -p "require('./package.json').name")" >> "$GITHUB_OUTPUT"
+          if [ -f "changelog/$version.json" ] && ! git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "mode=tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=pr" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag the release
+        if: steps.path.outputs.mode == 'tag'
+        working-directory: repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.path.outputs.version }}
+          NAME: ${{ steps.path.outputs.name }}
+          RELEASE_WORKFLOW: ${{ inputs.release-workflow }}
+        run: |
+          v="v$VERSION"
+          if [ "$v" = "v" ]; then
+            echo "::error::the release train computed an empty version; refusing to tag or dispatch at a guessed ref"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$v" -m "$NAME $VERSION"
+          git push origin "$v"
+          gh workflow run "$RELEASE_WORKFLOW" --ref "$v"
+          for _ in $(seq 1 10); do
+            if [ -n "$(gh run list --workflow "$RELEASE_WORKFLOW" --branch "$v" --limit 1 --json databaseId --jq '.[0].databaseId // ""')" ]; then
+              echo "::notice::tagged $v and started $RELEASE_WORKFLOW, which publishes it"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::warning title=Release run not seen::Tagged $v and dispatched $RELEASE_WORKFLOW, but no run appeared within 30s. Check the Actions tab; if there is nothing, start it with: gh workflow run $RELEASE_WORKFLOW --ref $v"
+
+      - name: Build the next release
+        if: steps.path.outputs.mode == 'pr'
+        id: next
+        working-directory: repo
+        env:
+          GEN: ${{ github.workspace }}/_workflows/tools/changelog-gen.mjs
+          BUMP: ${{ inputs.bump }}
+        run: |
+          next="$(node "$GEN" --next)"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          node "$GEN" --version "$next" --write > /dev/null
+          if [ -n "$BUMP" ]; then
+            VERSION="$next" bash -euo pipefail -c "$BUMP"
+          else
+            node -e '
+              const fs = require("fs")
+              for (const f of ["package.json", "package-lock.json"]) {
+                if (!fs.existsSync(f)) continue
+                const j = JSON.parse(fs.readFileSync(f, "utf8"))
+                j.version = process.argv[1]
+                if (j.packages && j.packages[""]) j.packages[""].version = process.argv[1]
+                fs.writeFileSync(f, JSON.stringify(j, null, 2) + "\n")
+              }
+            ' "$next"
+          fi
+
+      - name: Open or refresh the Release pull request
+        if: steps.path.outputs.mode == 'pr'
+        working-directory: repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.next.outputs.next }}
+          NAME: ${{ steps.path.outputs.name }}
+          GEN: ${{ github.workspace }}/_workflows/tools/changelog-gen.mjs
+          DISPATCH: ${{ inputs.dispatch }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          branch="release/next"
+          # The title is the squash-merge subject, so it is a conventional
+          # commit: the PR-title check passes it, and the merge lands under
+          # "Internal" in the next release instead of being skipped.
+          title="chore(release): $NEXT"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::notice::nothing to release"
+            exit 0
+          fi
+          git commit -m "$title"
+          git push --force origin "$branch"
+
+          # A push made with GITHUB_TOKEN raises the PR's `pull_request` runs as
+          # github-actions[bot], and they wait as `action_required` until
+          # someone approves them. `workflow_dispatch` is exempt, so start the
+          # PR's workflows at the branch: they report on the commit just pushed.
+          for workflow in $DISPATCH; do
+            if ! gh workflow run "$workflow" --ref "$branch"; then
+              echo "::warning title=Release CI not started::Pushed $branch, but dispatching $workflow at it failed. Start it with: gh workflow run $workflow --ref $branch"
+            fi
+          done
+
+          notes="$(node "$GEN" --from-json "changelog/$NEXT.json" | head -c 50000)"
+          # The backticks below are Markdown code spans in the pull request
+          # body, not command substitutions; the format string is literal.
+          # shellcheck disable=SC2016
+          body="$(printf '> [!WARNING]\n> **A human merges this one.** Merging it publishes `%s`, so an automated agent must never merge it, however green its checks are.\n\nMerging this pull request releases **%s**: it creates the `v%s` tag, which publishes the package and the GitHub release.\n\nThe notes below are the release notes, one line per change, linking the pull request it landed in. They are generated from the conventional-commit subjects since the last tag and stored in `changelog/%s.json`. Edit that file in this pull request to fix a wording; do not edit `CHANGELOG.md` by hand, it is rendered from the JSON.\n\n---\n\n%s\n' "$NAME" "$NEXT" "$NEXT" "$NEXT" "$notes")"
+
+          if existing="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number')" && [ -n "$existing" ]; then
+            gh pr edit "$existing" --title "$title" --body "$body"
+            echo "::notice::refreshed release PR #$existing for $NEXT"
+          elif out="$(gh pr create --head "$branch" --base "$BASE" --title "$title" --body "$body" 2>&1)"; then
+            echo "$out"
+            echo "::notice::opened the release PR for $NEXT"
+          elif printf '%s' "$out" | grep -qF 'not permitted to create or approve pull requests'; then
+            echo "$out"
+            url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$BASE...$branch?expand=1"
+            echo "::warning title=Release pull request not opened::Pushed $branch for $NEXT, but this repository does not let GitHub Actions open pull requests. Turn on Settings > Actions > General > Workflow permissions > \"Allow GitHub Actions to create and approve pull requests\". Until then, open it here: $url"
+          else
+            echo "$out" >&2
+            exit 1
+          fi
+
+      # The merge box refuses to merge while any run at the PR's head is
+      # `action_required`, even one no ruleset requires. The push above raises
+      # such runs, and approving them would only re-run what the dispatch
+      # already ran, so this deletes every waiting `pull_request` run at the
+      # head. Each appears a few seconds after its event, so it sweeps for a
+      # minute. A run it cannot delete is left for a maintainer, with a warning.
+      - name: Delete the Release PR's runs that wait for approval
+        if: steps.path.outputs.mode == 'pr'
+        working-directory: repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head="$(git ls-remote origin refs/heads/release/next | cut -f1)"
+          if [ -z "$head" ]; then
+            echo "::notice::no release/next branch, so no runs to delete"
+            exit 0
+          fi
+          deleted=0
+          failed=" "
+          for _ in $(seq 1 12); do
+            sleep 5
+            ids="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?event=pull_request&status=action_required&head_sha=$head&per_page=100" --jq '.workflow_runs[].id' || true)"
+            for id in $ids; do
+              case "$failed" in *" $id "*) continue ;; esac
+              if gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$id" > /dev/null; then
+                deleted=$((deleted + 1))
+              else
+                failed="$failed$id "
+                echo "::warning title=Release PR run not deleted::Run $id at $head waits for approval and could not be deleted, so the Release PR cannot merge until it is approved or deleted: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id"
+              fi
+            done
+          done
+          echo "::notice::deleted $deleted waiting pull_request run(s) at $head"

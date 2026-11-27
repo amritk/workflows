@@ -1,0 +1,50 @@
+name: PR description delta
+description: >-
+  Write a generated markdown block (a benchmark or bundle-size delta table) to
+  the job summary and splice it into the pull request description between
+  `<!-- <marker>:start -->` and `<!-- <marker>:end -->`, replacing the previous
+  run's block. A pull request from a fork gets the summary only, since its token
+  cannot edit the description.
+
+inputs:
+  file:
+    description: The markdown file to publish, relative to the workspace.
+    required: true
+  marker:
+    description: The marker name, such as `niv-bench-delta`. Lower-case letters, digits and dashes.
+    required: true
+  github-token:
+    description: "A token that may edit the pull request. Needs `pull-requests: write`."
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Add the block to the job summary
+      shell: bash
+      env:
+        FILE: ${{ inputs.file }}
+      run: cat "$FILE" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Update the pull request description
+      if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        FILE: ${{ inputs.file }}
+        MARKER: ${{ inputs.marker }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const { readFileSync } = require('node:fs')
+          const { spliceDelta } = require(`${process.env.ACTION_PATH}/../../tools/pr-delta.cjs`)
+          const block = readFileSync(process.env.FILE, 'utf8')
+          const { owner, repo } = context.repo
+          const pull_number = context.payload.pull_request.number
+          // Re-fetch the body rather than trusting the event payload: the
+          // description may have been edited since this run was queued.
+          const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number })
+          const body = pr.body ?? ''
+          const next = spliceDelta(body, block, process.env.MARKER)
+          if (next !== body) await github.rest.pulls.update({ owner, repo, pull_number, body: next })

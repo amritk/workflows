@@ -40,6 +40,9 @@ Contents: [Use it](#use-it) ·
 [Troubleshooting](#troubleshooting) ·
 [setup-nish on its own](#setup-nish-on-its-own) ·
 [Conventional PR titles](#conventional-pr-titles) ·
+[Release train](#release-train) ·
+[PR description delta](#pr-description-delta) ·
+[CI gate](#ci-gate) ·
 [Maintaining this repository](#maintaining-this-repository)
 
 ## Use it
@@ -601,9 +604,12 @@ jobs:
       - uses: amritk/workflows/actions/pr-title@<commit-sha> # v1.x.y
 ```
 
-The rule is nish's (`scripts/changelog-gen.mjs --check-subject` in
-[amritk/nish](https://github.com/amritk/nish)), ported exactly in
-[`tools/pr-title.mjs`](tools/pr-title.mjs):
+The rule is the release-notes generator's own
+([`tools/changelog-gen.mjs`](tools/changelog-gen.mjs), which came from
+[amritk/nish](https://github.com/amritk/nish)): the action runs its
+`--check-subject`, so a title it accepts is one the release notes can file.
+For a repository on [the release train](#release-train) it is the very script
+that writes those notes.
 
 - `type(scope)!: subject` — the scope and the `!` (a breaking change) are
   optional;
@@ -614,14 +620,105 @@ The rule is nish's (`scripts/changelog-gen.mjs --check-subject` in
 `edited` is what clears the check once a title is fixed. A merge-queue run
 passes, since the queue merges what was checked on the pull request. The title
 reaches the script through the environment, never spliced into a shell, since
-anyone opening a pull request writes it. A change to the rule belongs in nish's
-generator first and here second, so the two never accept different titles.
+anyone opening a pull request writes it.
+
+## Release train
+
+`release-train.yml` versions a package from its conventional commits without
+release-please: it is nish's release train, shared. On every push to the
+default branch it keeps one `chore(release): <version>` pull request open on
+`release/next`, holding the version bump, `changelog/<version>.json` (the
+structured record) and the `CHANGELOG.md` section, all written by
+[`tools/changelog-gen.mjs`](tools/changelog-gen.mjs) from the subjects since
+the last `v*` tag. Merging that pull request is the release: the next run tags
+`v<version>` and dispatches your release workflow at the tag. **A human merges
+it**; the pull request says so in its first line.
+
+```yaml
+# .github/workflows/release-pr.yml
+name: Release PR
+on:
+  push: { branches: [main] }
+  workflow_dispatch:
+permissions: {}
+jobs:
+  train:
+    uses: amritk/workflows/.github/workflows/release-train.yml@<commit-sha>
+    permissions: { contents: write, pull-requests: write, actions: write, id-token: write }
+    with:
+      bootstrap-from-npm: true # tag the published version if there is no v* tag yet
+```
+
+Inputs: `bump` (a command run with `VERSION` set that writes the version
+everywhere it is held; default: package.json and package-lock.json),
+`bootstrap-from-npm` (default `false`), `release-workflow` (default
+`release.yml`), `dispatch` (the workflows started at `release/next` so the
+Release PR gets checks; default `ci.yml pr-title.yml`), `node-version`.
+`id-token: write` is how the job learns which commit of this repository to run
+the generator from. The train runs only on the default branch of a repository
+that is not a fork, so a dispatch from another branch or a fork's push does nothing. Settings, Actions, General, Workflow permissions must allow
+GitHub Actions to create pull requests.
+
+Your release workflow, started at the tag, renders the GitHub release notes
+from the record the Release PR was reviewed with:
+
+```yaml
+- id: notes
+  uses: amritk/workflows/actions/release-notes@<commit-sha>
+  with: { version: 1.2.3 } # package.json's version
+- run: gh release create "$GITHUB_REF_NAME" --verify-tag --notes-file "${{ steps.notes.outputs.file }}"
+```
+
+## PR description delta
+
+`actions/pr-delta` keeps a generated markdown block (a benchmark or
+bundle-size delta table) in the pull request description: it writes the file to
+the job summary and splices it between `<!-- <marker>:start -->` and
+`<!-- <marker>:end -->`, replacing the previous run's block and repairing
+dangling markers. A pull request from a fork gets the summary only.
+
+```yaml
+- uses: amritk/workflows/actions/pr-delta@<commit-sha>
+  with:
+    file: bench-delta.md
+    marker: my-bench-delta
+```
+
+The job needs `pull-requests: write`. Measuring is yours: the file is whatever
+your compare script writes.
+
+## CI gate
+
+`actions/ci-gate` makes one job the check a repository requires: it fails
+unless every job it needs succeeded, so the required-checks list never goes
+stale when a job is added, renamed or turned into a matrix. A skipped job
+fails it unless named in `allow-skipped`. On a `workflow_dispatch` run, which
+is how the release train starts CI on its Release PR, it also posts the
+verdict as a `ci-gate` commit status, because a required check counts no check
+run from a dispatch.
+
+```yaml
+  ci-gate:
+    name: ci-gate
+    if: always()
+    needs: [lint, test, build] # every other job
+    runs-on: ubuntu-latest
+    permissions: { statuses: write }
+    steps:
+      - uses: amritk/workflows/actions/ci-gate@<commit-sha>
+        with:
+          needs: ${{ toJSON(needs) }}
+          # allow-skipped: '["docs"]'
+```
+
+Then require `ci-gate` in the branch's ruleset (Settings, Rules).
 
 ## Maintaining this repository
 
 - `tools/release.mjs` holds the packaging: the target table, the npm packages
-  and launcher, the Homebrew formula and the AUR files; `tools/pr-title.mjs`
-  holds the PR-title rule. `node --test 'tools/*.test.mjs'` runs their tests.
+  and launcher, the Homebrew formula and the AUR files; `tools/changelog-gen.mjs`
+  is the release-notes generator, whose `--check-subject` is the PR-title
+  rule; `tools/pr-delta.cjs` splices a block into a PR description. `node --test 'tools/*.test.mjs'` runs their tests.
 - CI runs those tests, actionlint over the workflows, and the release workflow
   itself as a dry run on [`test/hello`](test/hello): once as an app on every
   target with every channel on, once as a library, and once as a library with
