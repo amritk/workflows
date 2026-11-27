@@ -1,65 +1,65 @@
-// Tests for tools/pr-title.mjs: `node --test tools/`.
+// Tests for the title rule actions/pr-title applies: the release-notes
+// generator's own --check-subject. `node --test tools/`.
+//
+// These pin the cases where an inline grep pattern and nish's generator used
+// to disagree, so the rule cannot drift back to either one's quirks unnoticed.
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { fileURLToPath } from "node:url"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
 import { describe, it } from "node:test"
-import { TYPES, checkTitle, parseTitle } from "./pr-title.mjs"
+import { fileURLToPath } from "node:url"
 
-const SCRIPT = fileURLToPath(new URL("./pr-title.mjs", import.meta.url))
+const GENERATOR = fileURLToPath(new URL("./changelog-gen.mjs", import.meta.url))
+const TYPES = ["feat", "fix", "perf", "refactor", "docs", "test", "build", "ci", "chore"]
+// The action runs with no checkout, so the check must need no repository.
+const EMPTY = fs.mkdtempSync(path.join(os.tmpdir(), "pr-title-"))
+
+const check = (title) => spawnSync(process.execPath, [GENERATOR, "--check-subject", title], { cwd: EMPTY, encoding: "utf8" })
+const ok = (title) => check(title).status === 0
 
 describe("pr-title", () => {
   it("accepts every release-notes type, with or without a scope", () => {
     for (const type of TYPES) {
-      assert.equal(checkTitle(`${type}: do the thing`).ok, true, type)
-      assert.equal(checkTitle(`${type}(core): do the thing`).ok, true, type)
+      assert.equal(ok(`${type}: do the thing`), true, type)
+      assert.equal(ok(`${type}(core): do the thing`), true, type)
     }
   })
 
   it("accepts a breaking change marked with !", () => {
-    assert.equal(checkTitle("perf(codegen)!: hoist the array header out of element loops").ok, true)
-    assert.equal(checkTitle("feat!: drop Node 18").ok, true)
-    assert.equal(parseTitle("feat!: drop Node 18")?.bang, true)
+    assert.equal(ok("perf(codegen)!: hoist the array header out of element loops"), true)
+    assert.equal(ok("feat!: drop Node 18"), true)
   })
 
-  it("parses loosely where nish's generator does", () => {
-    // These are the cases an inline grep pattern used to reject and nish's
-    // generator accepts; the rule follows the generator.
+  it("parses scopes and spacing loosely", () => {
     for (const title of ["fix(Parser): handle tabs", "fix(parse tree): handle tabs", "fix:handle tabs", "fix:  handle tabs"])
-      assert.equal(checkTitle(title).ok, true, title)
-    assert.equal(parseTitle("fix:  handle tabs")?.subject, "handle tabs")
+      assert.equal(ok(title), true, title)
   })
 
   it("rejects types with no release-notes section", () => {
     for (const title of ["style: reformat the parser", "revert: undo the cache change", "feature: add x"]) {
-      const result = checkTitle(title)
-      assert.equal(result.ok, false, title)
-      assert.match(result.message, /unknown type/)
+      const r = check(title)
+      assert.equal(r.status, 1, title)
+      assert.match(r.stderr, /unknown type/)
     }
   })
 
   it("rejects a title that ends with a full stop", () => {
-    const result = checkTitle("fix(cli): exit 2 on a missing file.")
-    assert.equal(result.ok, false)
-    assert.match(result.message, /full stop/)
+    const r = check("fix(cli): exit 2 on a missing file.")
+    assert.equal(r.status, 1)
+    assert.match(r.stderr, /full stop/)
   })
 
   it("rejects a title that is not conventional at all", () => {
-    for (const title of ["Add an optional template compiler", "Fix: capital type", "fix handle tabs", ""]) {
-      const result = checkTitle(title)
-      assert.equal(result.ok, false, title)
-      assert.match(result.message, /not a conventional commit subject/)
+    for (const title of ["Add an optional template compiler", "Fix: capital type", "fix handle tabs", "", " feat: leading space"]) {
+      const r = check(title)
+      assert.equal(r.status, 1, title)
+      assert.match(r.stderr, /not a conventional commit subject/)
     }
   })
 
-  it("reads the title from the environment and exits by the verdict", () => {
-    const run = (title) => spawnSync(process.execPath, [SCRIPT], { env: { ...process.env, TITLE: title }, encoding: "utf8" })
-    const good = run("feat(cli): add --check")
-    assert.equal(good.status, 0)
-    assert.match(good.stdout, /^ok: feat\(cli\) — add --check/)
-    const bad = run("style: nope")
-    assert.equal(bad.status, 1)
-    assert.match(bad.stdout, /^::error title=PR title::unknown type `style`/)
-    // Shell metacharacters stay text: the title is never evaluated.
-    assert.equal(run("fix: $(touch /tmp/pwned) `id`").status, 0)
+  it("keeps a title with shell metacharacters as text", () => {
+    assert.equal(ok("fix: $(touch /tmp/pwned) `id`"), true)
   })
 })
