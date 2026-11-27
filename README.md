@@ -39,6 +39,7 @@ Contents: [Use it](#use-it) ·
 [Inputs](#inputs) · [Verifying a release](#verifying-a-release) ·
 [Troubleshooting](#troubleshooting) ·
 [setup-nish on its own](#setup-nish-on-its-own) ·
+[Conventional PR titles](#conventional-pr-titles) ·
 [Maintaining this repository](#maintaining-this-repository)
 
 ## Use it
@@ -576,11 +577,51 @@ WASI sysroot and compiler-rt's wasm32 builtins and sets `WASI_SYSROOT`, so
 `.nish-version`), `wasi` (default `false`). Outputs: `version`, `nish` (its
 absolute path).
 
+## Conventional PR titles
+
+`actions/pr-title` fails a pull request whose title is not a conventional
+commit subject. In a repository that squash-merges, the title becomes the
+subject of the commit on `main`, which is what release-please (and nish's own
+release-notes generator) read for the release notes and the version bump, so a
+title they cannot classify is a change missing from both.
+
+```yaml
+# .github/workflows/pr-title.yml
+name: PR title
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  merge_group:
+permissions: {}
+jobs:
+  check:
+    name: conventional title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amritk/workflows/actions/pr-title@<commit-sha> # v1.x.y
+```
+
+The rule is nish's (`scripts/changelog-gen.mjs --check-subject` in
+[amritk/nish](https://github.com/amritk/nish)), ported exactly in
+[`tools/pr-title.mjs`](tools/pr-title.mjs):
+
+- `type(scope)!: subject` — the scope and the `!` (a breaking change) are
+  optional;
+- the type is one with a release-notes section: `feat`, `fix`, `perf`,
+  `refactor`, `docs`, `test`, `build`, `ci`, `chore`;
+- no full stop at the end: the title is a heading, not a sentence.
+
+`edited` is what clears the check once a title is fixed. A merge-queue run
+passes, since the queue merges what was checked on the pull request. The title
+reaches the script through the environment, never spliced into a shell, since
+anyone opening a pull request writes it. A change to the rule belongs in nish's
+generator first and here second, so the two never accept different titles.
+
 ## Maintaining this repository
 
 - `tools/release.mjs` holds the packaging: the target table, the npm packages
-  and launcher, the Homebrew formula and the AUR files. `node --test
-  'tools/*.test.mjs'` runs its tests.
+  and launcher, the Homebrew formula and the AUR files; `tools/pr-title.mjs`
+  holds the PR-title rule. `node --test 'tools/*.test.mjs'` runs their tests.
 - CI runs those tests, actionlint over the workflows, and the release workflow
   itself as a dry run on [`test/hello`](test/hello): once as an app on every
   target with every channel on, once as a library, and once as a library with

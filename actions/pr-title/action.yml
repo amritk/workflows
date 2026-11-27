@@ -1,0 +1,29 @@
+name: Conventional PR title
+description: >-
+  Fail unless the pull request's title is a conventional commit subject, by the
+  rule nish's release-notes generator applies: `type(scope)!: subject`, a type
+  with a release-notes section (feat, fix, perf, refactor, docs, test, build,
+  ci, chore), and no full stop at the end. A merge-queue run has no title and
+  passes, since the queue merges what was checked on the pull request.
+
+inputs:
+  title:
+    description: The title to check. Defaults to the pull request's.
+    required: false
+    default: ${{ github.event.pull_request.title }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the title
+      shell: bash
+      env:
+        # Through the environment, never spliced into the script: a title is
+        # text anyone opening a pull request can write.
+        TITLE: ${{ inputs.title }}
+      run: |
+        if [ "$GITHUB_EVENT_NAME" = "merge_group" ]; then
+          echo "merge queue: the title was checked on the pull request"
+          exit 0
+        fi
+        node "$GITHUB_ACTION_PATH/../../tools/pr-title.mjs"
