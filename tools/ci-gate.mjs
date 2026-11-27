@@ -10,7 +10,8 @@
 //
 //   NEEDS='${{ toJSON(needs) }}' ALLOW_SKIPPED='["docs"]' node tools/ci-gate.mjs
 
-import { pathToFileURL } from "node:url"
+import fs from "node:fs"
+import { fileURLToPath } from "node:url"
 
 /**
  * The jobs that did not pass, each as `job: result`; empty when the gate
@@ -33,7 +34,19 @@ export const gate = (needs, allowSkipped) => {
   return bad
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+// Compared as real paths: Node resolves this module's URL through symlinks
+// and argv[1] only through `path.resolve`, so on a runner whose work or
+// actions directory is a symlink a plain URL comparison would skip the verdict
+// and exit 0 -- a gate that passes without looking.
+const isMain = (() => {
+  try {
+    return fs.realpathSync(fileURLToPath(import.meta.url)) === fs.realpathSync(process.argv[1] ?? "")
+  } catch {
+    return false
+  }
+})()
+
+if (isMain) {
   let bad
   try {
     const allowSkipped = JSON.parse(process.env.ALLOW_SKIPPED || "[]")

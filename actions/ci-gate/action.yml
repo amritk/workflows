@@ -31,9 +31,13 @@ runs:
         NEEDS: ${{ inputs.needs }}
         ALLOW_SKIPPED: ${{ inputs.allow-skipped }}
       run: |
-        if node "$GITHUB_ACTION_PATH/../../tools/ci-gate.mjs"; then
+        # Pass only on the verdict's own success line, not on a zero exit
+        # status alone: a script that ran nothing must not read as green.
+        if out="$(node "$GITHUB_ACTION_PATH/../../tools/ci-gate.mjs")" && [ "$out" = "every needed job succeeded" ]; then
+          echo "$out"
           echo "ok=true" >> "$GITHUB_OUTPUT"
         else
+          printf '%s\n' "$out"
           echo "ok=false" >> "$GITHUB_OUTPUT"
         fi
 

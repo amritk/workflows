@@ -37,3 +37,24 @@ describe("ci-gate", () => {
     assert.equal(run({ NEEDS: '{"a":{"result":"skipped"}}', ALLOW_SKIPPED: '"a"' }).status, 1)
   })
 })
+
+describe("ci-gate entry point", () => {
+  it("runs the verdict when invoked through a symlinked path", async () => {
+    const { mkdtempSync, symlinkSync, rmSync } = await import("node:fs")
+    const { tmpdir } = await import("node:os")
+    const { join, dirname } = await import("node:path")
+    const dir = mkdtempSync(join(tmpdir(), "ci-gate-"))
+    try {
+      const link = join(dir, "tools")
+      symlinkSync(dirname(SCRIPT), link)
+      const r = spawnSync(process.execPath, [join(link, "ci-gate.mjs")], {
+        env: { ...process.env, NEEDS: '{"a":{"result":"failure"}}' },
+        encoding: "utf8",
+      })
+      assert.equal(r.status, 1)
+      assert.match(r.stdout, /a: failure/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})

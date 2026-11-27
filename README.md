@@ -655,7 +655,8 @@ everywhere it is held; default: package.json and package-lock.json),
 `release.yml`), `dispatch` (the workflows started at `release/next` so the
 Release PR gets checks; default `ci.yml pr-title.yml`), `node-version`.
 `id-token: write` is how the job learns which commit of this repository to run
-the generator from. Settings, Actions, General, Workflow permissions must allow
+the generator from. The train runs only on the default branch of a repository
+that is not a fork, so a dispatch from another branch or a fork's push does nothing. Settings, Actions, General, Workflow permissions must allow
 GitHub Actions to create pull requests.
 
 Your release workflow, started at the tag, renders the GitHub release notes
